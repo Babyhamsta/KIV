@@ -1,6 +1,12 @@
 """
 Debug why model forward pass slows down with context length.
 
+WARNING: This script uses removed APIs (config.global_layer_indices,
+hardcoded range(35) layer counts) and will not run as-is. These fields
+now live on middleware.topology (e.g. middleware.topology.global_layer_indices,
+middleware.topology.independent_kv_layers). Needs updating for the new
+KIV middleware/topology API before use.
+
 With hot_budget=2048 and sliding_window=512, every layer should see
 bounded KV during decode. If decode time grows with context, something
 inside the model is scaling unexpectedly.

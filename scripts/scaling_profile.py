@@ -138,11 +138,15 @@ def main():
         v_fetch_ms = 0
         num_cold_layers = 0
 
-        for layer_idx in config.independent_kv_layers:
+        for layer_idx in middleware.topology.independent_kv_layers:
             cs = cache.cold_stores[layer_idx]
             if cs.cold_length > 0:
                 num_cold_layers += 1
-                fake_q = torch.randn(1, 8, 1, 512, device=device, dtype=torch.bfloat16)
+                fake_q = torch.randn(
+                    1, middleware.topology.num_query_heads, 1,
+                    middleware.topology.head_dim,
+                    device=device, dtype=torch.bfloat16,
+                )
 
                 # Profile the full coarse-to-fine pipeline
                 torch.cuda.synchronize()
@@ -163,7 +167,7 @@ def main():
         hot_mb = mem["hot_vram_bytes"] / 1024 / 1024
         cpu_mb = mem["total_cpu_bytes"] / 1024 / 1024
 
-        cold_len = cache.cold_stores[4].cold_length if 4 in cache.cold_stores else 0
+        cold_len = next(iter(cache.cold_stores.values())).cold_length if cache.cold_stores else 0
 
         print(
             f"{ctx_len:>8} {num_chunks:>6} {total_prefill:>8.2f} {avg_chunk:>10.1f} "

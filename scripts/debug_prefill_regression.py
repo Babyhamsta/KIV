@@ -1,6 +1,11 @@
 """
 Debug why prefill regressed from 304s to 1067s at 1M tokens.
 Profile what happens inside each chunk during bounded prefill.
+
+WARNING: This script uses removed APIs (ColdKVStore(config, device)
+without topology argument) and will not run as-is. ColdKVStore now
+requires a ModelTopology as its second argument. Needs updating for
+the new KIV middleware/topology API before use.
 """
 import gc
 import sys

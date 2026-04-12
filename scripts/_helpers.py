@@ -25,13 +25,13 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from kiv import KIVConfig, KIVMiddleware
 
 
-def load_model(attn_implementation: str = "sdpa"):
+def load_model(model_id: str = "google/gemma-4-E2B-it", attn_implementation: str = "sdpa"):
     """
-    Load Gemma 4 E2B in 4-bit NF4 quantization.
+    Load a model in 4-bit NF4 quantization.
 
     Returns (model, tokenizer, device).
     """
-    print("Loading model...", flush=True)
+    print(f"Loading {model_id}...", flush=True)
     t0 = time.perf_counter()
 
     bnb_config = BitsAndBytesConfig(
@@ -40,13 +40,13 @@ def load_model(attn_implementation: str = "sdpa"):
         bnb_4bit_quant_type="nf4",
     )
     model = AutoModelForCausalLM.from_pretrained(
-        "google/gemma-4-E2B-it",
+        model_id,
         quantization_config=bnb_config,
         device_map="auto",
         dtype=torch.bfloat16,
         attn_implementation=attn_implementation,
     )
-    tokenizer = AutoTokenizer.from_pretrained("google/gemma-4-E2B-it")
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
     model.eval()
     device = next(model.parameters()).device
 

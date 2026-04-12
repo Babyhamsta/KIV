@@ -166,7 +166,10 @@ def test_correctness_long(model, tokenizer, middleware: KIVMiddleware) -> dict:
     kiv_probs = F.softmax(kiv_logits, dim=-1)
     kl = F.kl_div(kiv_probs.log(), vanilla_probs, reduction="sum").item()
 
-    cold_len = cache.cold_stores[14].cold_length if 14 in cache.cold_stores else 0
+    cold_len = 0
+    if cache.cold_stores:
+        first_store = next(iter(cache.cold_stores.values()))
+        cold_len = first_store.cold_length
     hot_len = seq_len - cold_len
 
     print(f"  Hot: {hot_len}, Cold: {cold_len}")

@@ -1,4 +1,10 @@
-"""Profile KIV decode step to find bottlenecks."""
+"""Profile KIV decode step to find bottlenecks.
+
+WARNING: This script uses removed APIs (config.independent_kv_layers,
+score_cold, fetch_top_p_values, memory_report keys) and will not run
+as-is. It has been superseded by scaling_profile.py. Needs updating
+for the new KIV middleware/topology API before use.
+"""
 import sys
 import os
 import time

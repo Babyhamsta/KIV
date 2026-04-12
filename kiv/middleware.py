@@ -1,30 +1,73 @@
 """
-KIV Middleware: installs tiered KV cache into Gemma 4 E2B without
-modifying model weights. Monkey-patches attention forward for global layers.
+KIV Middleware: installs tiered KV cache into any HuggingFace transformer
+without modifying model weights or attention forwards.
+
+Uses two model-agnostic hooks:
+  1. TieredKVCache (extends DynamicCache) — handles hot storage + cold eviction
+  2. Custom attention function — retrieves cold K/V, concatenates, delegates
+     to standard attention (sdpa/flash/eager)
 """
 
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
 from typing import Any
 
 import torch
+from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from .config import KIVConfig
-from .partitioned_attn import two_partition_attention
+from .model_topology import ModelTopology, detect_topology, _find_text_model
 from .tiered_cache import TieredKVCache
 
 logger = logging.getLogger(__name__)
 
 
+# ── Mask extension helper ──
+
+
+def _extend_mask_for_cold(
+    mask: torch.Tensor, num_cold: int
+) -> torch.Tensor:
+    """Prepend columns to attention mask for cold tokens (all attendable).
+
+    Handles multiple mask conventions:
+      - Float masks (additive): 0.0 = attend, -inf = ignore → prepend 0.0
+      - Bool masks: True = attend → prepend True
+      - 2D masks [B, KV] or 4D masks [B, H, Q, KV]
+    """
+    if mask.dtype == torch.bool:
+        fill_value = True
+    else:
+        fill_value = 0.0
+
+    if mask.ndim == 2:
+        # [B, KV] → prepend along last dim
+        cold_cols = mask.new_full((mask.shape[0], num_cold), fill_value)
+    elif mask.ndim == 4:
+        # [B, H, Q, KV] → prepend along last dim
+        cold_cols = mask.new_full(
+            (mask.shape[0], mask.shape[1], mask.shape[2], num_cold),
+            fill_value,
+        )
+    else:
+        # Unknown shape — try prepending on last dim
+        shape = list(mask.shape)
+        shape[-1] = num_cold
+        cold_cols = mask.new_full(shape, fill_value)
+
+    return torch.cat([cold_cols, mask], dim=-1)
+
+
 class KIVMiddleware:
     """
-    Installs K-Indexed V Materialization into a Gemma 4 E2B model.
+    Installs K-Indexed V Materialization into any HuggingFace transformer.
 
-    Does not modify model weights. Patches attention forward functions
-    for the 7 global attention layers to use two-partition attention
-    with the TieredKVCache.
+    Does not modify model weights or attention forward functions. Instead:
+    1. Registers a custom attention function that augments hot K/V with
+       cold retrievals before delegating to standard attention.
+    2. Provides TieredKVCache as a drop-in for DynamicCache.
 
     Usage:
         middleware = KIVMiddleware(model, config)
@@ -34,48 +77,118 @@ class KIVMiddleware:
         middleware.uninstall()
     """
 
-    def __init__(self, model: Any, config: KIVConfig | None = None) -> None:
+    def __init__(
+        self,
+        model: Any,
+        config: KIVConfig | None = None,
+        topology: ModelTopology | None = None,
+    ) -> None:
         self.model = model
         self.config = config or KIVConfig()
-        self._text_model = self._find_text_model()
-        self._original_forwards: dict[int, Callable] = {}
+        self._topology_override = topology
+        self.topology: ModelTopology | None = None
+        self._text_model: Any = None
         self._installed = False
-
-    def _find_text_model(self):
-        """Navigate HF model hierarchy to find text model with layers."""
-        if hasattr(self.model, "model") and hasattr(self.model.model, "language_model"):
-            return self.model.model.language_model
-        if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
-            return self.model.model
-        raise AttributeError("Cannot find text model layers in model hierarchy.")
+        self._original_impl: str | None = None
+        self._kiv_key: str | None = None
 
     def install(self) -> None:
-        """Patch attention forward for all global layers."""
+        """Install KIV: detect topology, register attention function."""
         if self._installed:
             logger.warning("KIV middleware already installed.")
             return
 
-        for layer_idx in self.config.global_layer_indices:
+        # Detect or use provided topology
+        if self._topology_override is not None:
+            self.topology = self._topology_override
+            logger.info("Using manually provided ModelTopology.")
+        else:
+            self.topology = detect_topology(self.model)
+
+        self._text_model = _find_text_model(self.model)
+
+        # Mark global layers with their index
+        for layer_idx in self.topology.global_layer_indices:
             attn = self._text_model.layers[layer_idx].self_attn
-            self._original_forwards[layer_idx] = attn.forward
-            attn.forward = self._make_kiv_forward(attn, layer_idx)
-            logger.debug("Patched layer %d attention with KIV forward", layer_idx)
+            attn._kiv_layer_idx = layer_idx
+
+        # Register custom attention function (in both attention and mask registries)
+        self._original_impl = self._resolve_attn_impl()
+        original_fn = self._get_attn_fn(self._original_impl)
+        self._kiv_key = f"kiv_{self._original_impl}"
+        ALL_ATTENTION_FUNCTIONS[self._kiv_key] = self._make_kiv_attention(
+            original_fn
+        )
+        # Mirror the mask function from the original implementation.
+        # Must use _global_mapping because _preprocess_mask_arguments
+        # checks _global_mapping directly (not the local override dict).
+        if self._original_impl in ALL_MASK_ATTENTION_FUNCTIONS:
+            ALL_MASK_ATTENTION_FUNCTIONS._global_mapping[self._kiv_key] = (
+                ALL_MASK_ATTENTION_FUNCTIONS[self._original_impl]
+            )
+        self._set_attn_impl(self._kiv_key)
 
         self._installed = True
         logger.info(
-            "KIV middleware installed on %d global layers (hot=%d, top_p=%d)",
-            len(self.config.global_layer_indices),
+            "KIV middleware installed: %d global layers (%d independent, %d shared), "
+            "attn=%s, hot=%d, top_p=%d",
+            len(self.topology.global_layer_indices),
+            len(self.topology.independent_kv_layers),
+            len(self.topology.kv_sharing_map),
+            self._original_impl,
             self.config.hot_budget,
             self.config.top_p,
         )
 
     def uninstall(self) -> None:
-        """Restore original attention forward methods."""
-        for layer_idx, orig in self._original_forwards.items():
-            self._text_model.layers[layer_idx].self_attn.forward = orig
-        self._original_forwards.clear()
+        """Remove KIV: restore original attention, clean up attributes."""
+        if not self._installed:
+            return
+
+        # Restore original attention implementation
+        if self._original_impl is not None:
+            self._set_attn_impl(self._original_impl)
+
+        # Remove registered attention and mask functions
+        if self._kiv_key is not None:
+            if self._kiv_key in ALL_ATTENTION_FUNCTIONS:
+                del ALL_ATTENTION_FUNCTIONS[self._kiv_key]
+            ALL_MASK_ATTENTION_FUNCTIONS._global_mapping.pop(self._kiv_key, None)
+
+        # Clean up attributes on attention modules
+        if self._text_model is not None and self.topology is not None:
+            for layer_idx in self.topology.global_layer_indices:
+                attn = self._text_model.layers[layer_idx].self_attn
+                for attr in ("_kiv_layer_idx", "_kiv_cache"):
+                    if hasattr(attn, attr):
+                        delattr(attn, attr)
+
         self._installed = False
+        self._original_impl = None
+        self._kiv_key = None
         logger.info("KIV middleware uninstalled.")
+
+    def create_cache(self, device: torch.device | None = None) -> TieredKVCache:
+        """Create a TieredKVCache configured for this model."""
+        if self.topology is None:
+            raise RuntimeError("Call install() before create_cache().")
+
+        if device is None:
+            device = next(self.model.parameters()).device
+
+        cache = TieredKVCache(
+            config=self.model.config,
+            kiv_config=self.config,
+            topology=self.topology,
+            device=device,
+        )
+
+        # Store cache reference on each global attention module
+        for layer_idx in self.topology.global_layer_indices:
+            attn = self._text_model.layers[layer_idx].self_attn
+            attn._kiv_cache = cache
+
+        return cache
 
     def chunked_prefill(
         self,
@@ -93,7 +206,7 @@ class KIVMiddleware:
             chunk_size: tokens per chunk (default 4096)
             prefill_hot_cap: if set, cap the hot cache at this many tokens
                 during prefill. Oldest tokens evict to cold but cold is NOT
-                attended during prefill (evict-only, no two-partition).
+                attended during prefill (evict-only, no retrieval).
                 This bounds VRAM at the cost of losing exact attention to
                 early tokens. If None, hot cache grows unbounded.
 
@@ -104,7 +217,7 @@ class KIVMiddleware:
         num_chunks = (T + chunk_size - 1) // chunk_size
         logits = None
 
-        # During bounded prefill, suppress two-partition attention.
+        # During bounded prefill, suppress cold retrieval.
         # Evicted tokens go to cold but aren't re-attended — hot-only attention.
         if prefill_hot_cap is not None:
             cache._suppress_cold = True
@@ -134,7 +247,7 @@ class KIVMiddleware:
 
             torch.cuda.empty_cache()
 
-        # Re-enable cold attention for generation
+        # Re-enable cold retrieval for generation
         cache._suppress_cold = False
 
         # Final eviction to hot_budget for generation phase
@@ -146,155 +259,99 @@ class KIVMiddleware:
 
         return logits
 
-    def create_cache(self, device: torch.device | None = None) -> TieredKVCache:
-        """Create a TieredKVCache configured for this model."""
-        if device is None:
-            device = next(self.model.parameters()).device
-        return TieredKVCache(
-            config=self.model.config,
-            kiv_config=self.config,
-            device=device,
+    # ── Attention function registration ──
+
+    def _resolve_attn_impl(self) -> str:
+        """Get the model's current attention implementation name."""
+        config = self.model.config
+        if hasattr(config, "text_config"):
+            config = config.text_config
+        return getattr(config, "_attn_implementation", "eager")
+
+    def _get_attn_fn(self, impl: str):
+        """Get the attention function for a given implementation."""
+        if impl in ALL_ATTENTION_FUNCTIONS:
+            return ALL_ATTENTION_FUNCTIONS[impl]
+        # For "eager", the model uses its own module-level function.
+        # Look it up from the first global attention module.
+        attn_module = self._text_model.layers[
+            self.topology.global_layer_indices[0]
+        ].self_attn
+        model_module_name = type(attn_module).__module__
+        import importlib
+        model_module = importlib.import_module(model_module_name)
+        eager_fn = getattr(model_module, "eager_attention_forward", None)
+        if eager_fn is not None:
+            return eager_fn
+        raise ValueError(
+            f"Cannot find attention function for implementation '{impl}'"
         )
 
-    def _make_kiv_forward(
-        self, attn_module: Any, layer_idx: int
-    ) -> Callable:
-        """
-        Create a replacement forward for one global attention layer.
+    def _set_attn_impl(self, impl: str) -> None:
+        """Set the attention implementation on the model config."""
+        config = self.model.config
+        if hasattr(config, "text_config"):
+            config.text_config._attn_implementation = impl
+        config._attn_implementation = impl
 
-        The replacement:
-        1. Computes Q, K, V using the original projections
-        2. For non-shared: calls cache.update() (with eviction)
-        3. For shared: reads hot K,V from shared_kv_states
-        4. If cold entries exist: two_partition_attention()
-        5. Else: standard eager attention
-        6. Output projection and return
-        """
-        config = self.config
-        orig_forward = self._original_forwards[layer_idx]
+    def _make_kiv_attention(self, original_fn):
+        """Build the KIV attention wrapper that augments with cold retrievals."""
+        kiv_config = self.config
 
-        # Import here to avoid circular imports at module level
-        import transformers.models.gemma4.modeling_gemma4 as gemma4_mod
-        from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
-        apply_rotary_pos_emb = gemma4_mod.apply_rotary_pos_emb
-        eager_attention_forward = gemma4_mod.eager_attention_forward
-
-        # Resolve attention implementation (sdpa, flash_attention_2, or eager)
-        attn_impl = attn_module.config._attn_implementation
-        if attn_impl != "eager":
-            default_attention_forward = ALL_ATTENTION_FUNCTIONS[attn_impl]
+        # Compute fallback scaling from model (handles Gemma4's scaling=1.0)
+        sample_attn = self._text_model.layers[
+            self.topology.global_layer_indices[0]
+        ].self_attn
+        if hasattr(sample_attn, "scaling") and sample_attn.scaling is not None:
+            fallback_scaling = sample_attn.scaling
         else:
-            default_attention_forward = eager_attention_forward
+            fallback_scaling = self.topology.head_dim ** -0.5
 
-        # Capture attention module attributes
-        is_shared = attn_module.is_kv_shared_layer
-        kv_shared_idx = attn_module.kv_shared_layer_index
-        store_full_kv = attn_module.store_full_length_kv
-        head_dim = attn_module.head_dim
-        scaling = attn_module.scaling  # 1.0 for Gemma 4 (QK norm handles magnitude)
+        def kiv_attention(
+            module, query, key, value, attention_mask, **kwargs
+        ):
+            cache = getattr(module, "_kiv_cache", None)
+            layer_idx = getattr(module, "_kiv_layer_idx", None)
 
-        def kiv_forward(
-            hidden_states: torch.Tensor,
-            position_embeddings: torch.Tensor,
-            attention_mask: torch.Tensor | None,
-            shared_kv_states: dict,
-            past_key_values: Any | None = None,
-            **kwargs: Any,
-        ) -> tuple[torch.Tensor, torch.Tensor | None]:
-            input_shape = hidden_states.shape[:-1]
-            hidden_shape = (*input_shape, -1, head_dim)
+            if cache is not None and layer_idx is not None:
+                cold_store = cache.get_cold_store(layer_idx)
 
-            cos, sin = position_embeddings
-
-            # ── Q projection (always computed) ──
-            query_states = attn_module.q_proj(hidden_states).view(hidden_shape)
-            query_states = attn_module.q_norm(query_states)
-            query_states = apply_rotary_pos_emb(query_states, cos, sin, unsqueeze_dim=2)
-            query_states = query_states.transpose(1, 2)  # [B, H_q, Q, D]
-
-            # ── K, V (shared vs independent) ──
-            if is_shared:
-                key_states, value_states = shared_kv_states[kv_shared_idx]
-                key_states = key_states.to(query_states.device)
-                value_states = value_states.to(query_states.device)
-            else:
-                key_states = attn_module.k_proj(hidden_states).view(hidden_shape)
-                v_proj = getattr(attn_module, "v_proj", None)
-                if v_proj is not None:
-                    value_states = v_proj(hidden_states).view(hidden_shape)
-                else:
-                    # attention_k_eq_v: V = k_proj output (before norms)
-                    value_states = key_states
-
-                key_states = attn_module.k_norm(key_states)
-                key_states = apply_rotary_pos_emb(
-                    key_states, cos, sin, unsqueeze_dim=2
-                )
-                key_states = key_states.transpose(1, 2)  # [B, H_kv, T, D]
-
-                value_states = attn_module.v_norm(value_states)
-                value_states = value_states.transpose(1, 2)  # [B, H_kv, T, D]
-
-                # Cache update (handles eviction for TieredKVCache)
-                if past_key_values is not None:
-                    key_states, value_states = past_key_values.update(
-                        key_states, value_states, layer_idx
+                if (
+                    cold_store is not None
+                    and cold_store.cold_length > 0
+                    and not getattr(cache, "_suppress_cold", False)
+                ):
+                    scaling = kwargs.get("scaling")
+                    if scaling is None:
+                        scaling = fallback_scaling
+                    cold_k, cold_v = cold_store.retrieve_top_kv(
+                        query, scaling, kiv_config
                     )
 
-            # Store hot KV for shared layers (layer 14 only)
-            if store_full_kv:
-                shared_kv_states[layer_idx] = key_states, value_states
+                    if cold_k is not None:
+                        # Crop mask to match hot K/V size (mask was
+                        # created before eviction, so it may be wider)
+                        hot_len = key.shape[2]
+                        if (
+                            attention_mask is not None
+                            and attention_mask.shape[-1] > hot_len
+                        ):
+                            attention_mask = attention_mask[
+                                ..., -hot_len:
+                            ]
 
-            # ── Decide: standard attention or two-partition ──
-            cold_store = None
-            if past_key_values is not None and isinstance(past_key_values, TieredKVCache):
-                cold_store = past_key_values.get_cold_store(layer_idx)
+                        # Prepend cold K/V to hot K/V
+                        key = torch.cat([cold_k, key], dim=2)
+                        value = torch.cat([cold_v, value], dim=2)
 
-            use_partitioned = (
-                cold_store is not None
-                and cold_store.cold_length > 0
-                and not getattr(past_key_values, "_suppress_cold", False)
+                        # Extend mask for cold tokens (all attendable)
+                        if attention_mask is not None:
+                            attention_mask = _extend_mask_for_cold(
+                                attention_mask, cold_k.shape[2]
+                            )
+
+            return original_fn(
+                module, query, key, value, attention_mask, **kwargs
             )
 
-            if use_partitioned:
-                # Crop mask to match hot cache size (mask was created
-                # before eviction, so it may be larger)
-                hot_len = key_states.shape[2]
-                hot_mask = attention_mask
-                if hot_mask is not None and hot_mask.shape[-1] > hot_len:
-                    # Keep only the last hot_len columns (most recent tokens)
-                    hot_mask = hot_mask[:, :, :, -hot_len:]
-
-                # Two-partition attention
-                attn_output = two_partition_attention(
-                    query=query_states,
-                    hot_key=key_states,
-                    hot_value=value_states,
-                    cold_store=cold_store,
-                    hot_mask=hot_mask,
-                    config=config,
-                    scaling=scaling,
-                )
-                # attn_output: [B, H_q, Q, D]
-                attn_output = attn_output.transpose(1, 2).contiguous()
-                attn_weights = None
-            else:
-                # Standard attention (sdpa/flash/eager based on model config)
-                attn_output, attn_weights = default_attention_forward(
-                    attn_module,
-                    query_states,
-                    key_states,
-                    value_states,
-                    attention_mask,
-                    dropout=0.0,
-                    scaling=scaling,
-                    sliding_window=None,  # global layers have no window
-                    **kwargs,
-                )
-
-            # ── Output projection ──
-            attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-            attn_output = attn_module.o_proj(attn_output)
-            return attn_output, attn_weights
-
-        return kiv_forward
+        return kiv_attention

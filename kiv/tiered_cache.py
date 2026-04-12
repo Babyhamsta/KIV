@@ -9,6 +9,7 @@ from transformers import DynamicCache
 
 from .cold_store import ColdKVStore
 from .config import KIVConfig
+from .model_topology import ModelTopology
 
 logger = logging.getLogger(__name__)
 
@@ -18,34 +19,37 @@ class TieredKVCache(DynamicCache):
     Drop-in replacement for DynamicCache that adds tiered KV management
     for global attention layers.
 
-    Sliding layers use standard DynamicSlidingWindowLayer behavior.
-    Global layers (4, 9, 14) use DynamicLayer with eviction to ColdKVStore
+    Sliding layers use standard DynamicCache behavior.
+    Independent global layers use DynamicLayer with eviction to ColdKVStore
     when the hot cache exceeds hot_budget.
 
-    Shared layers (19-34) never call update() — they read from shared_kv_states.
-    All global layers access cold stores via get_cold_store().
+    Shared layers never call update() — they read from shared_kv_states
+    in the model's own forward. All global layers access cold stores
+    via get_cold_store(), which resolves shared layers to their source.
     """
 
     def __init__(
         self,
         config,
         kiv_config: KIVConfig,
+        topology: ModelTopology,
         device: torch.device | None = None,
     ) -> None:
         super().__init__(config=config)
         self.kiv_config = kiv_config
+        self.topology = topology
 
         if device is None:
             device = torch.device("cuda")
 
         # One cold store per independent KV layer
         self.cold_stores: dict[int, ColdKVStore] = {}
-        for layer_idx in kiv_config.independent_kv_layers:
-            self.cold_stores[layer_idx] = ColdKVStore(kiv_config, device)
+        for layer_idx in topology.independent_kv_layers:
+            self.cold_stores[layer_idx] = ColdKVStore(kiv_config, topology, device)
 
         # Track whether we're past prefill (eviction only starts after)
         self._prefill_complete = False
-        # When True, patched forward skips two-partition (hot-only attention)
+        # When True, attention function skips cold retrieval (hot-only attention)
         self._suppress_cold = False
         # Track total tokens per layer (hot + cold) for position tracking
         self._total_tokens: dict[int, int] = {}
@@ -63,7 +67,7 @@ class TieredKVCache(DynamicCache):
 
     def _evict_to_cap(self, cap: int) -> None:
         """Evict tokens exceeding cap from global layers. Used during bounded prefill."""
-        for layer_idx in self.kiv_config.independent_kv_layers:
+        for layer_idx in self.topology.independent_kv_layers:
             if layer_idx >= len(self.layers):
                 continue
             layer = self.layers[layer_idx]
@@ -91,7 +95,7 @@ class TieredKVCache(DynamicCache):
     def _evict_excess_all_layers(self) -> None:
         """Evict tokens exceeding hot_budget from all independent global layers."""
         budget = self.kiv_config.hot_budget
-        for layer_idx in self.kiv_config.independent_kv_layers:
+        for layer_idx in self.topology.independent_kv_layers:
             if layer_idx >= len(self.layers):
                 continue
             layer = self.layers[layer_idx]
@@ -135,18 +139,18 @@ class TieredKVCache(DynamicCache):
         """
         Override DynamicCache.update with eviction for global layers.
 
-        For global layers (4, 9, 14):
+        For independent global layers:
           1. Concatenate new K,V via parent update()
           2. If past prefill and hot > budget: evict oldest to cold
           3. Return hot-only K,V
 
-        For sliding layers: delegate entirely to parent.
+        For all other layers: delegate entirely to parent.
         """
         # Standard update (concatenate)
         keys, values = super().update(key_states, value_states, layer_idx, *args, **kwargs)
 
         # Track total tokens
-        if layer_idx in self.kiv_config.independent_kv_layers:
+        if layer_idx in self.topology.independent_kv_layers:
             cold_len = self.cold_stores[layer_idx].cold_length
             hot_len = keys.shape[2]
             self._total_tokens[layer_idx] = cold_len + hot_len
@@ -185,13 +189,13 @@ class TieredKVCache(DynamicCache):
     def get_cold_store(self, layer_idx: int) -> ColdKVStore | None:
         """
         Get cold store for a layer, resolving shared layers to their source.
-
-        Layers 19-34 resolve to layer 14's cold store.
         """
         if layer_idx in self.cold_stores:
             return self.cold_stores[layer_idx]
-        if layer_idx in self.kiv_config.global_layer_indices:
-            return self.cold_stores.get(self.kiv_config.kv_shared_source)
+        # Check if this is a shared global layer
+        source = self.topology.kv_sharing_map.get(layer_idx)
+        if source is not None:
+            return self.cold_stores.get(source)
         return None
 
     def get_mask_sizes(self, query_length: int, layer_idx: int) -> tuple[int, int]:
@@ -203,8 +207,9 @@ class TieredKVCache(DynamicCache):
         cold_length so the causal mask correctly maps KV columns to
         their real sequence positions.
         """
-        if layer_idx in self.cold_stores and layer_idx < len(self.layers):
-            cold_len = self.cold_stores[layer_idx].cold_length
+        cold_store = self.get_cold_store(layer_idx)
+        if cold_store is not None and layer_idx < len(self.layers):
+            cold_len = cold_store.cold_length
             if cold_len > 0:
                 layer = self.layers[layer_idx]
                 hot_len = layer.get_seq_length() if layer.is_initialized else 0
@@ -240,7 +245,7 @@ class TieredKVCache(DynamicCache):
     def memory_report(self) -> dict:
         """Report memory usage across all tiers."""
         hot_bytes = 0
-        for layer_idx in self.kiv_config.independent_kv_layers:
+        for layer_idx in self.topology.independent_kv_layers:
             if layer_idx < len(self.layers) and self.layers[layer_idx].is_initialized:
                 layer = self.layers[layer_idx]
                 hot_bytes += layer.keys.nelement() * layer.keys.element_size()

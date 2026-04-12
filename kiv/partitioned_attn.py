@@ -17,9 +17,14 @@ def two_partition_attention(
     hot_mask: torch.Tensor | None,
     config: KIVConfig,
     scaling: float,
+    num_kv_groups: int = 8,
 ) -> torch.Tensor:
     """
     Attention over hot cache + top-P cold entries with log-sum-exp merge.
+
+    .. deprecated::
+        This module is deprecated. The new architecture uses concatenation-based
+        attention via KIVMiddleware instead of two-partition attention.
 
     Args:
         query:     [B, H_q, Q, D] — 8 query heads
@@ -29,11 +34,11 @@ def two_partition_attention(
         hot_mask:  [B, 1, Q, H_len] causal mask (additive, -inf for invalid)
         config:    KIVConfig
         scaling:   head_dim ** -0.5
+        num_kv_groups: number of query heads per KV head (default 8)
 
     Returns:
         [B, H_q, Q, D] attention output
     """
-    num_kv_groups = config.num_query_heads // config.num_kv_heads
 
     # ── Partition 1: Hot (exact) ──
     hot_k = _repeat_kv(hot_key, num_kv_groups)    # [B, 8, H_len, D]
