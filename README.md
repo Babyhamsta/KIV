@@ -1,6 +1,6 @@
 # KIV: K-Indexed V Materialization
 
-Middleware that extends Gemma 4 E2B's context window to 1M+ tokens on a 12GB consumer GPU by replacing the standard KV cache with a tiered retrieval system. No model weights are modified.
+Middleware that extends any HuggingFace transformer's context window to 1M+ tokens on a consumer GPU by replacing the standard KV cache with a tiered retrieval system. No model weights are modified. Tested on Gemma 4 E2B, Qwen2.5, TinyLlama, and Phi-3.5 across MQA, GQA, and MHA architectures.
 
 ## How it works
 
@@ -135,6 +135,36 @@ middleware.install()
 cache = middleware.create_cache()
 ```
 
+## Supported models
+
+KIV auto-detects model architecture via `detect_topology()` and works with any HuggingFace model that uses `DynamicCache`. No model-specific code is needed.
+
+| Model | Parameters | Attention | KV Heads | Tested | Notes |
+|-------|-----------|-----------|----------|--------|-------|
+| Gemma 4 E2B | 2B | Sliding + global | 1 (MQA) | Full suite | Primary development model. KV sharing across layers. |
+| Qwen2.5 | 3B | All global | 2 (GQA) | Correctness + needle | Exact logit match, needle retrieval confirmed. |
+| TinyLlama | 1.1B | All global | 4 (GQA) | Correctness + generation | Exact logit match. Llama architecture verified. |
+| Phi-3.5 mini | 3.8B | All global | 32 (MHA) | Correctness + generation | Exact logit match. Full MHA (no GQA) verified. |
+| Llama 3 / 3.2 | 1B-8B | All global | 8 (GQA) | Topology detection | Auto-detection verified. |
+| Mistral | 7B | Sliding (uniform) | 8 (GQA) | Topology detection | All layers treated as global by KIV. |
+| Gemma 2 / 3 | 2B-27B | Sliding + global | Varies | Topology detection | Architecture auto-detected. |
+| Cohere Command R | Varies | Sliding + global | Varies | Topology detection | `layer_types` field detected. |
+
+Models not listed should still work if they use the standard HuggingFace `DynamicCache` and `ALL_ATTENTION_FUNCTIONS` interface. If auto-detection fails, pass a manual `ModelTopology`:
+
+```python
+from kiv import KIVMiddleware, KIVConfig, ModelTopology
+
+topology = ModelTopology.manual(
+    global_layer_indices=tuple(range(32)),  # all layers global
+    num_query_heads=32,
+    num_kv_heads=8,
+    head_dim=128,
+    num_hidden_layers=32,
+)
+middleware = KIVMiddleware(model, KIVConfig(), topology=topology)
+```
+
 ## Requirements
 
 - Python 3.10+
@@ -142,4 +172,3 @@ cache = middleware.create_cache()
 - Transformers 5.5+
 - NVIDIA GPU with 12GB+ VRAM
 - 16GB+ system RAM (32GB for 1M context)
-- Model: `google/gemma-4-E2B-it`
