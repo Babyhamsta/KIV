@@ -12,3 +12,4 @@ kv_analysis/
 *.pt
 *.safetensors
 .cache/
+kiv.egg-info/

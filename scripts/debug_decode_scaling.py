@@ -1,12 +1,6 @@
 """
 Debug why model forward pass slows down with context length.
 
-WARNING: This script uses removed APIs (config.global_layer_indices,
-hardcoded range(35) layer counts) and will not run as-is. These fields
-now live on middleware.topology (e.g. middleware.topology.global_layer_indices,
-middleware.topology.independent_kv_layers). Needs updating for the new
-KIV middleware/topology API before use.
-
 With hot_budget=2048 and sliding_window=512, every layer should see
 bounded KV during decode. If decode time grows with context, something
 inside the model is scaling unexpectedly.
@@ -64,6 +58,10 @@ def main():
     config = KIVConfig(hot_budget=2048, top_p=256)
     middleware = KIVMiddleware(model, config)
     middleware.install()
+    topology = middleware.topology
+    global_layers = list(topology.global_layer_indices)
+    global_layer_set = set(global_layers)
+    num_layers = topology.num_hidden_layers
 
     CHUNK_SIZE = 4096
 
@@ -125,24 +123,23 @@ def main():
             h.remove()
 
         # ── Analyze ──
-        cold_len = cache.cold_stores[4].cold_length
+        cold_len = max((store.cold_length for store in cache.cold_stores.values()), default=0)
 
         # Categorize layers
-        sliding_layers = [i for i in range(35) if i not in config.global_layer_indices]
-        global_layers = list(config.global_layer_indices)
+        sliding_layers = [i for i in range(num_layers) if i not in global_layer_set]
 
         sliding_total = sum(layer_times.get(i, 0) for i in sliding_layers) * 1000
         global_total = sum(layer_times.get(i, 0) for i in global_layers) * 1000
-        sliding_avg = sliding_total / len(sliding_layers)
-        global_avg = global_total / len(global_layers)
+        sliding_avg = sliding_total / max(len(sliding_layers), 1)
+        global_avg = global_total / max(len(global_layers), 1)
 
         # Check cache sizes for each layer type
         sliding_kv_lens = []
         global_hot_lens = []
-        for i in range(35):
+        for i in range(num_layers):
             if i < len(cache.layers) and cache.layers[i].is_initialized:
                 kv_len = cache.layers[i].keys.shape[2] if hasattr(cache.layers[i], 'keys') and cache.layers[i].keys.numel() > 0 else 0
-                if i in config.global_layer_indices:
+                if i in global_layer_set:
                     global_hot_lens.append(kv_len)
                 else:
                     sliding_kv_lens.append(kv_len)
@@ -170,7 +167,7 @@ def main():
         sorted_layers = sorted(layer_times.items(), key=lambda x: x[1], reverse=True)
         print(f"  Top 5 slowest layers:", flush=True)
         for idx, t in sorted_layers[:5]:
-            ltype = "GLOBAL" if idx in config.global_layer_indices else "sliding"
+            ltype = "GLOBAL" if idx in global_layer_set else "sliding"
             kv = 0
             if idx < len(cache.layers) and cache.layers[idx].is_initialized:
                 kv = cache.layers[idx].keys.shape[2] if hasattr(cache.layers[idx], 'keys') and cache.layers[idx].keys.numel() > 0 else 0
@@ -179,7 +176,13 @@ def main():
         # Check what's happening with the mask
         seq_len_reported = cache.get_seq_length(0)
         print(f"  cache.get_seq_length(0)={seq_len_reported} (sliding layer 0)", flush=True)
-        print(f"  cache.get_seq_length(4)={cache.get_seq_length(4)} (global layer 4)", flush=True)
+        if global_layers:
+            first_global = global_layers[0]
+            print(
+                f"  cache.get_seq_length({first_global})={cache.get_seq_length(first_global)} "
+                f"(global layer {first_global})",
+                flush=True,
+            )
 
         del cache
         gc.collect(); torch.cuda.empty_cache()

@@ -213,42 +213,51 @@ class KIVMiddleware:
         Returns:
             logits for the last token: [B, vocab_size]
         """
+        if not self._installed:
+            raise RuntimeError("Call install() before chunked_prefill().")
+
         B, T = input_ids.shape
         num_chunks = (T + chunk_size - 1) // chunk_size
         logits = None
 
-        # During bounded prefill, suppress cold retrieval.
-        # Evicted tokens go to cold but aren't re-attended — hot-only attention.
+        # During prefill, bypass the KIV attention wrapper entirely.
+        # No cold retrieval happens during prefill, so the wrapper is pure
+        # overhead. Using the native attention path is much faster.
         if prefill_hot_cap is not None:
             cache._suppress_cold = True
+        self._set_attn_impl(self._original_impl)
 
-        for i in range(num_chunks):
-            start = i * chunk_size
-            end = min(start + chunk_size, T)
-            chunk_ids = input_ids[:, start:end]
+        try:
+            for i in range(num_chunks):
+                start = i * chunk_size
+                end = min(start + chunk_size, T)
+                chunk_ids = input_ids[:, start:end]
 
-            with torch.no_grad():
-                outputs = self.model(
-                    input_ids=chunk_ids,
-                    past_key_values=cache,
-                    use_cache=True,
-                )
+                with torch.no_grad():
+                    outputs = self.model(
+                        input_ids=chunk_ids,
+                        past_key_values=cache,
+                        use_cache=True,
+                    )
 
-            # Only keep logits from the last chunk
-            if end == T:
-                logits = outputs.logits[:, -1, :]
+                # Only keep logits from the last chunk
+                if end == T:
+                    logits = outputs.logits[:, -1, :]
 
-            # Free intermediate logits
-            del outputs
+                # Free intermediate logits
+                del outputs
 
-            # Bounded prefill: evict excess from hot to cold (no re-attending)
-            if prefill_hot_cap is not None:
-                cache._evict_to_cap(prefill_hot_cap)
+                # Bounded prefill: evict excess from hot to cold
+                if prefill_hot_cap is not None:
+                    cache._evict_to_cap(prefill_hot_cap)
 
-            torch.cuda.empty_cache()
-
-        # Re-enable cold retrieval for generation
-        cache._suppress_cold = False
+                # Periodic VRAM cleanup to prevent fragmentation
+                if i % 8 == 7:
+                    torch.cuda.empty_cache()
+        finally:
+            # Always restore KIV attention wrapper, even on exception
+            cache._suppress_cold = False
+            self._set_attn_impl(self._kiv_key)
 
         # Final eviction to hot_budget for generation phase
         if prefill_hot_cap is None:
@@ -325,7 +334,8 @@ class KIVMiddleware:
                     if scaling is None:
                         scaling = fallback_scaling
                     cold_k, cold_v = cold_store.retrieve_top_kv(
-                        query, scaling, kiv_config
+                        query, scaling, kiv_config,
+                        step=getattr(cache, "_decode_step", -1),
                     )
 
                     if cold_k is not None:

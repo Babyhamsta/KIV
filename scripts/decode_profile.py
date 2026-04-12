@@ -1,10 +1,4 @@
-"""Profile KIV decode step to find bottlenecks.
-
-WARNING: This script uses removed APIs (config.independent_kv_layers,
-score_cold, fetch_top_p_values, memory_report keys) and will not run
-as-is. It has been superseded by scaling_profile.py. Needs updating
-for the new KIV middleware/topology API before use.
-"""
+"""Profile KIV decode step to find bottlenecks."""
 import sys
 import os
 import time
@@ -81,6 +75,7 @@ def main():
             config = KIVConfig(hot_budget=2048, top_p=top_p)
             middleware = KIVMiddleware(model, config)
             middleware.install()
+            topology = middleware.topology
 
             # ── Phase 1: Chunked Prefill ──
             cache = middleware.create_cache(device)
@@ -115,11 +110,12 @@ def main():
             _, evict_time = profile_section("Eviction (hot->cold)", do_eviction)
 
             # Report cold store stats
-            for layer_idx in config.independent_kv_layers:
+            for layer_idx in topology.independent_kv_layers:
                 cs = cache.cold_stores[layer_idx]
                 if cs.cold_length > 0:
                     print(f"    Layer {layer_idx}: cold={cs.cold_length} tokens, "
-                          f"k_index={cs._k_index.shape}", flush=True)
+                          f"pages={cs.num_pages}, finalized={cs._num_finalized}",
+                          flush=True)
 
             # ── Phase 3: Decode steps ──
             decode_times = []
@@ -154,39 +150,29 @@ def main():
             print(f"  {'Full decode step':40s} {t_full:>8.3f}s", flush=True)
 
             # Now profile cold store operations separately
-            # Score cold (K-index dot product)
-            for layer_idx in config.independent_kv_layers:
+            for layer_idx in topology.independent_kv_layers:
                 cs = cache.cold_stores[layer_idx]
                 if cs.cold_length > 0:
                     # Fake query for profiling
-                    fake_q = torch.randn(1, 8, 1, 512, device=device, dtype=torch.bfloat16)
+                    fake_q = torch.randn(
+                        1,
+                        topology.num_query_heads,
+                        1,
+                        topology.head_dim,
+                        device=device,
+                        dtype=torch.bfloat16,
+                    )
 
                     torch.cuda.synchronize()
                     t0 = time.perf_counter()
-                    scores = cs.score_cold(fake_q, scaling=1.0)
+                    cold_k, cold_v = cs.retrieve_top_kv(fake_q, 1.0, config)
                     torch.cuda.synchronize()
-                    t_score = time.perf_counter() - t0
-
-                    # Top-P selection
-                    t0 = time.perf_counter()
-                    P = min(top_p, cs.cold_length)
-                    top_scores, top_idx = scores.topk(P, dim=-1)
-                    torch.cuda.synchronize()
-                    t_topk = time.perf_counter() - t0
-
-                    # V fetch
-                    t0 = time.perf_counter()
-                    V_fetched = cs.fetch_top_p_values(top_idx)
-                    torch.cuda.synchronize()
-                    t_fetch = time.perf_counter() - t0
+                    t_retrieve = time.perf_counter() - t0
 
                     print(f"  Layer {layer_idx} cold ops (cold={cs.cold_length}):", flush=True)
-                    print(f"    {'K-index score (Q@K^T)':38s} {t_score*1000:>8.2f}ms", flush=True)
-                    print(f"    {'Top-P selection':38s} {t_topk*1000:>8.2f}ms", flush=True)
-                    print(f"    {'V fetch CPU->GPU':38s} {t_fetch*1000:>8.2f}ms", flush=True)
-                    print(f"    {'Total cold overhead':38s} {(t_score+t_topk+t_fetch)*1000:>8.2f}ms", flush=True)
+                    print(f"    {'retrieve_top_kv':38s} {t_retrieve*1000:>8.2f}ms", flush=True)
 
-                    del scores, top_scores, top_idx, V_fetched, fake_q
+                    del cold_k, cold_v, fake_q
 
             # Summary
             total_prefill = sum(chunk_times)

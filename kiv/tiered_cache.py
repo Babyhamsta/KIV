@@ -53,6 +53,12 @@ class TieredKVCache(DynamicCache):
         self._suppress_cold = False
         # Track total tokens per layer (hot + cold) for position tracking
         self._total_tokens: dict[int, int] = {}
+        # Decode step counter for cold store candidate caching
+        self._decode_step: int = 0
+
+    def _kv_source_layer_idx(self, layer_idx: int) -> int:
+        """Resolve shared global layers to the layer that owns their KV cache."""
+        return self.topology.kv_sharing_map.get(layer_idx, layer_idx)
 
     def mark_prefill_complete(self) -> None:
         """
@@ -149,8 +155,14 @@ class TieredKVCache(DynamicCache):
         # Standard update (concatenate)
         keys, values = super().update(key_states, value_states, layer_idx, *args, **kwargs)
 
-        # Track total tokens
+        # Track total tokens and increment decode step on first independent layer
         if layer_idx in self.topology.independent_kv_layers:
+            if (
+                self._prefill_complete
+                and self.topology.independent_kv_layers
+                and layer_idx == self.topology.independent_kv_layers[0]
+            ):
+                self._decode_step += 1
             cold_len = self.cold_stores[layer_idx].cold_length
             hot_len = keys.shape[2]
             self._total_tokens[layer_idx] = cold_len + hot_len
@@ -208,10 +220,11 @@ class TieredKVCache(DynamicCache):
         their real sequence positions.
         """
         cold_store = self.get_cold_store(layer_idx)
-        if cold_store is not None and layer_idx < len(self.layers):
+        source_layer_idx = self._kv_source_layer_idx(layer_idx)
+        if cold_store is not None and source_layer_idx < len(self.layers):
             cold_len = cold_store.cold_length
             if cold_len > 0:
-                layer = self.layers[layer_idx]
+                layer = self.layers[source_layer_idx]
                 hot_len = layer.get_seq_length() if layer.is_initialized else 0
                 kv_length = hot_len + query_length
                 kv_offset = cold_len
@@ -230,6 +243,12 @@ class TieredKVCache(DynamicCache):
         if layer_idx in self._total_tokens:
             return self._total_tokens[layer_idx]
 
+        source_layer_idx = self._kv_source_layer_idx(layer_idx)
+        if source_layer_idx in self._total_tokens:
+            return self._total_tokens[source_layer_idx]
+        if source_layer_idx != layer_idx:
+            return super().get_seq_length(source_layer_idx)
+
         # For sliding/other layers, use parent behavior
         return super().get_seq_length(layer_idx)
 
@@ -241,6 +260,7 @@ class TieredKVCache(DynamicCache):
         self._total_tokens.clear()
         self._prefill_complete = False
         self._suppress_cold = False
+        self._decode_step = 0
 
     def memory_report(self) -> dict:
         """Report memory usage across all tiers."""

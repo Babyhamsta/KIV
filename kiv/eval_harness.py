@@ -138,24 +138,46 @@ def test_correctness_long(model, tokenizer, middleware: KIVMiddleware) -> dict:
         print("  SKIP: prompt shorter than hot_budget, can't test eviction")
         return {"skipped": True}
 
-    # Vanilla forward
+    # Vanilla prefill + one decode step
     middleware.uninstall()
+    from transformers import DynamicCache
+    vanilla_cache = DynamicCache(config=model.config)
     with torch.no_grad():
-        vanilla_out = model(input_ids=input_ids, use_cache=False)
+        vanilla_prefill = model(
+            input_ids=input_ids,
+            past_key_values=vanilla_cache,
+            use_cache=True,
+        )
+    next_token = vanilla_prefill.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+    with torch.no_grad():
+        vanilla_out = model(
+            input_ids=next_token,
+            past_key_values=vanilla_cache,
+            use_cache=True,
+        )
     vanilla_logits = vanilla_out.logits[0, -1].float()
 
     # KIV forward with P = all cold tokens (should be lossless)
     orig_top_p = middleware.config.top_p
+    orig_top_pages = middleware.config.top_pages
     middleware.config.top_p = 999999  # retrieve everything
-    middleware.install()
-    cache = middleware.create_cache(device)
-    with torch.no_grad():
-        kiv_out = model(input_ids=input_ids, past_key_values=cache, use_cache=True)
-    cache.mark_prefill_complete()
-    kiv_logits = kiv_out.logits[0, -1].float()
-
-    # Restore config
-    middleware.config.top_p = orig_top_p
+    middleware.config.top_pages = 999999
+    try:
+        middleware.install()
+        cache = middleware.create_cache(device)
+        with torch.no_grad():
+            model(input_ids=input_ids, past_key_values=cache, use_cache=True)
+        cache.mark_prefill_complete()
+        with torch.no_grad():
+            kiv_out = model(
+                input_ids=next_token,
+                past_key_values=cache,
+                use_cache=True,
+            )
+        kiv_logits = kiv_out.logits[0, -1].float()
+    finally:
+        middleware.config.top_p = orig_top_p
+        middleware.config.top_pages = orig_top_pages
 
     # Compare
     max_diff = (vanilla_logits - kiv_logits).abs().max().item()
@@ -204,18 +226,37 @@ def test_compression_quality(model, tokenizer, middleware: KIVMiddleware) -> dic
         print("  SKIP: prompt shorter than hot_budget")
         return {"skipped": True}
 
-    # Vanilla
+    # Vanilla prefill + one decode step
     middleware.uninstall()
+    from transformers import DynamicCache
+    vanilla_cache = DynamicCache(config=model.config)
     with torch.no_grad():
-        vanilla_out = model(input_ids=input_ids, use_cache=False)
+        vanilla_prefill = model(
+            input_ids=input_ids,
+            past_key_values=vanilla_cache,
+            use_cache=True,
+        )
+    next_token = vanilla_prefill.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+    with torch.no_grad():
+        vanilla_out = model(
+            input_ids=next_token,
+            past_key_values=vanilla_cache,
+            use_cache=True,
+        )
     vanilla_logits = vanilla_out.logits[0, -1].float()
 
-    # KIV with configured top_p
+    # KIV with configured top_p, exercising retrieval on the first decode step
     middleware.install()
     cache = middleware.create_cache(device)
     with torch.no_grad():
-        kiv_out = model(input_ids=input_ids, past_key_values=cache, use_cache=True)
+        model(input_ids=input_ids, past_key_values=cache, use_cache=True)
     cache.mark_prefill_complete()
+    with torch.no_grad():
+        kiv_out = model(
+            input_ids=next_token,
+            past_key_values=cache,
+            use_cache=True,
+        )
     kiv_logits = kiv_out.logits[0, -1].float()
 
     # Metrics

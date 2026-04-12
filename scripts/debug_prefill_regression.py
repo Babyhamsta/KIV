@@ -1,11 +1,6 @@
 """
 Debug why prefill regressed from 304s to 1067s at 1M tokens.
 Profile what happens inside each chunk during bounded prefill.
-
-WARNING: This script uses removed APIs (ColdKVStore(config, device)
-without topology argument) and will not run as-is. ColdKVStore now
-requires a ModelTopology as its second argument. Needs updating for
-the new KIV middleware/topology API before use.
 """
 import gc
 import sys
@@ -57,6 +52,8 @@ def main():
     config = KIVConfig(hot_budget=2048, top_p=256, page_size=128, top_pages=32)
     middleware = KIVMiddleware(model, config)
     middleware.install()
+    topology = middleware.topology
+    first_layer_idx = topology.independent_kv_layers[0]
 
     cache = middleware.create_cache(device)
     # Mimic chunked_prefill: suppress cold, forward first, evict after
@@ -89,7 +86,7 @@ def main():
         torch.cuda.synchronize()
         evict_ms = (time.perf_counter() - t0) * 1000
 
-        store = cache.cold_stores[4]
+        store = cache.cold_stores[first_layer_idx]
         pages = store.num_pages
         cold = store.cold_length
 
@@ -102,18 +99,24 @@ def main():
     print(f"\n=== Test 2: Breakdown inside evict_from_hot ===", flush=True)
 
     from kiv.cold_store import ColdKVStore
-    store = ColdKVStore(config, device)
+    store = ColdKVStore(config, topology, device)
 
     # Simulate eviction of 2048 tokens (typical per chunk)
-    fake_k = torch.randn(1, 1, 2048, 512, device=device, dtype=torch.bfloat16)
-    fake_v = torch.randn(1, 1, 2048, 512, device=device, dtype=torch.bfloat16)
+    fake_k = torch.randn(
+        1, topology.num_kv_heads, 2048, topology.head_dim,
+        device=device, dtype=torch.bfloat16,
+    )
+    fake_v = torch.randn_like(fake_k)
 
     # Warmup
     store.evict_from_hot(fake_k.clone(), fake_v.clone())
 
     # Timed run
-    fake_k = torch.randn(1, 1, 2048, 512, device=device, dtype=torch.bfloat16)
-    fake_v = torch.randn(1, 1, 2048, 512, device=device, dtype=torch.bfloat16)
+    fake_k = torch.randn(
+        1, topology.num_kv_heads, 2048, topology.head_dim,
+        device=device, dtype=torch.bfloat16,
+    )
+    fake_v = torch.randn_like(fake_k)
 
     torch.cuda.synchronize()
     t0 = time.perf_counter()
@@ -126,9 +129,12 @@ def main():
     # Now profile the inner operations
     print(f"\n  Breakdown of page finalization (2048 tok = 16 pages):", flush=True)
 
-    store2 = ColdKVStore(config, device)
-    fake_k = torch.randn(1, 1, 2048, 512, device=device, dtype=torch.bfloat16)
-    fake_v = torch.randn(1, 1, 2048, 512, device=device, dtype=torch.bfloat16)
+    store2 = ColdKVStore(config, topology, device)
+    fake_k = torch.randn(
+        1, topology.num_kv_heads, 2048, topology.head_dim,
+        device=device, dtype=torch.bfloat16,
+    )
+    fake_v = torch.randn_like(fake_k)
 
     # Manually step through what evict_from_hot does
     store2._partial_k = fake_k
@@ -189,8 +195,11 @@ def main():
     # ── Test 3: Compare with old brute-force eviction (no pages) ──
     print(f"\n=== Test 3: Old-style eviction (no page construction) ===", flush=True)
 
-    fake_k = torch.randn(1, 1, 2048, 512, device=device, dtype=torch.bfloat16)
-    fake_v = torch.randn(1, 1, 2048, 512, device=device, dtype=torch.bfloat16)
+    fake_k = torch.randn(
+        1, topology.num_kv_heads, 2048, topology.head_dim,
+        device=device, dtype=torch.bfloat16,
+    )
+    fake_v = torch.randn_like(fake_k)
 
     torch.cuda.synchronize()
     t0 = time.perf_counter()
