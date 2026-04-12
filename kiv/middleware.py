@@ -10,6 +10,7 @@ Uses two model-agnostic hooks:
 
 from __future__ import annotations
 
+import inspect
 import logging
 from typing import Any
 
@@ -25,6 +26,24 @@ logger = logging.getLogger(__name__)
 
 
 # ── Mask extension helper ──
+
+
+def _prefill_logits_kwargs(model: Any, logits_to_keep: int = 1) -> dict[str, int]:
+    """
+    Return optional forward kwargs that avoid unused prefill logits.
+
+    This is feature-detected instead of model-family-specific. Recent
+    HuggingFace causal LMs expose ``logits_to_keep`` to compute logits only
+    for the last N positions while still running the full transformer.
+    """
+    try:
+        parameters = inspect.signature(model.forward).parameters
+    except (TypeError, ValueError, AttributeError):
+        return {}
+
+    if "logits_to_keep" in parameters:
+        return {"logits_to_keep": logits_to_keep}
+    return {}
 
 
 def _extend_mask_for_cold(
@@ -219,6 +238,7 @@ class KIVMiddleware:
         B, T = input_ids.shape
         num_chunks = (T + chunk_size - 1) // chunk_size
         logits = None
+        logits_kwargs = _prefill_logits_kwargs(self.model, logits_to_keep=1)
 
         # During prefill, bypass the KIV attention wrapper entirely.
         # No cold retrieval happens during prefill, so the wrapper is pure
@@ -238,6 +258,7 @@ class KIVMiddleware:
                         input_ids=chunk_ids,
                         past_key_values=cache,
                         use_cache=True,
+                        **logits_kwargs,
                     )
 
                 # Only keep logits from the last chunk
