@@ -6,6 +6,10 @@ Middleware that extends any HuggingFace transformer's context window to 1M+ toke
 
 KIV replaces the standard KV cache for global attention layers with a page-based tiered system. The model's own attention code runs unmodified — KIV operates entirely through the HuggingFace cache interface and a thin attention function wrapper.
 
+### Why it works: K/V asymmetry
+
+The key insight behind KIV is that K and V vectors have fundamentally different properties. K vectors are smooth and structurally regular — tokens about similar topics produce similar K vectors, which means K space is indexable. A page summary (mean K over 128 tokens) retains enough signal to identify which pages are relevant to a query. V vectors are high-entropy and carry the actual content the model reads from — they resist summarization and must be retrieved exactly. KIV exploits this asymmetry: K vectors are indexed and scored cheaply on GPU via page summaries, while V vectors are stored in full on CPU and fetched only for the tokens that score highest. This avoids the impossible choice between compressing everything (lossy) and keeping everything in VRAM (expensive).
+
 ### Architecture
 
 ```mermaid
@@ -89,7 +93,8 @@ Full results in [KIV-RESULTS.md](KIV-RESULTS.md).
 ## Quick start
 
 ```bash
-pip install kiv
+git clone https://github.com/Babyhamsta/KIV.git && cd KIV
+pip install -e .
 ```
 
 ```python
@@ -107,10 +112,9 @@ output = model.generate(input_ids, past_key_values=cache, use_cache=True)
 middleware.uninstall()
 ```
 
-To run the benchmarks from source:
+To run the benchmarks:
 
 ```bash
-git clone https://github.com/Babyhamsta/KIV.git && cd KIV
 pip install -e ".[all]"
 
 python scripts/run_eval.py            # Smoke test
