@@ -141,6 +141,8 @@ tests/                  # Unit tests
 
 ## Configuration
 
+KIV has four tunable parameters. Model architecture (layer indices, head counts, KV sharing) is auto-detected — you only configure the algorithm.
+
 ```python
 from kiv import KIVConfig, KIVMiddleware
 
@@ -154,6 +156,15 @@ middleware = KIVMiddleware(model, config)
 middleware.install()
 cache = middleware.create_cache()
 ```
+
+| Parameter | Default | What it controls |
+|-----------|---------|------------------|
+| `hot_budget` | 2048 | Number of recent tokens kept in VRAM with exact K+V. Higher values use more VRAM but give exact attention over a larger window. |
+| `top_p` | 256 | Cold tokens retrieved per decode step. Higher values improve retrieval recall at the cost of more CPU-to-GPU transfer and a larger attention window. |
+| `page_size` | 128 | Tokens per page in the cold store. Each page gets one summary vector (mean K). Smaller pages give finer-grained retrieval but more summaries to score. |
+| `top_pages` | 32 | Pages selected in the coarse scoring pass. Their K vectors are fetched from CPU for fine scoring. Higher values widen the candidate pool. |
+
+**Tuning guidance:** The defaults work well for most use cases. If retrieval quality matters more than speed, increase `top_p` (e.g., 512 or 1024). If you have VRAM headroom, increasing `hot_budget` gives exact attention over more recent context. `page_size` and `top_pages` rarely need changing — the coarse-to-fine pipeline is designed so that `top_pages * page_size` (default: 4096 candidates) is large enough to contain the top-P tokens for most queries.
 
 ## Supported models
 
