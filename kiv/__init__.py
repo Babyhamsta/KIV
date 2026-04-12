@@ -7,6 +7,8 @@ retrieval. No model weights are modified. Works with any HF model that
 uses DynamicCache.
 """
 
+__version__ = "0.1.0"
+
 from .config import KIVConfig
 from .cold_store import ColdKVStore
 from .model_topology import ModelTopology, detect_topology

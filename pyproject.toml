@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kiv"
+version = "0.1.0"
+description = "K-Indexed V Materialization — extend any HuggingFace transformer's context to 1M+ tokens on a consumer GPU"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+authors = [
+    { name = "Babyhamsta" },
+]
+keywords = ["transformers", "kv-cache", "long-context", "attention", "llm"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.1.0",
+    "transformers>=5.5.0",
+]
+
+[project.optional-dependencies]
+quantization = [
+    "bitsandbytes>=0.43.0",
+    "accelerate>=0.25.0",
+]
+test = [
+    "pytest>=7.0.0",
+    "datasets>=2.14.0",
+]
+all = [
+    "kiv[quantization,test]",
+    "tqdm>=4.65.0",
+    "numpy>=1.24.0",
+]
+
+[project.urls]
+Repository = "https://github.com/Babyhamsta/KIV"
+
+[tool.setuptools.packages.find]
+include = ["kiv*"]
+exclude = ["scripts*", "tests*", "outputs*", "kv_analysis*", "gla_archive*"]

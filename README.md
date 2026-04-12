@@ -89,19 +89,35 @@ Full results in [KIV-RESULTS.md](KIV-RESULTS.md).
 ## Quick start
 
 ```bash
-pip install -r requirements.txt
+pip install kiv
+```
 
-# Smoke test
-python scripts/run_eval.py
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from kiv import KIVConfig, KIVMiddleware
 
-# Needle retrieval sweep (4K-32K, all depths)
-python scripts/needle_grid.py
+model = AutoModelForCausalLM.from_pretrained("your-model", device_map="auto")
+tokenizer = AutoTokenizer.from_pretrained("your-model")
 
-# Scaling profile (4K-1M, decode + prefill timing)
-python scripts/scaling_profile.py
+middleware = KIVMiddleware(model, KIVConfig())
+middleware.install()
+cache = middleware.create_cache()
 
-# Adversarial tests (phonebook, collision, multi-needle, two-hop)
-python scripts/adversarial.py
+output = model.generate(input_ids, past_key_values=cache, use_cache=True)
+middleware.uninstall()
+```
+
+To run the benchmarks from source:
+
+```bash
+git clone https://github.com/Babyhamsta/KIV.git && cd KIV
+pip install -e ".[all]"
+
+python scripts/run_eval.py            # Smoke test
+python scripts/needle_grid.py         # Needle retrieval sweep (4K-32K)
+python scripts/scaling_profile.py     # Scaling profile (4K-1M)
+python scripts/adversarial.py         # Adversarial tests
+python scripts/multi_model_test.py    # Multi-model compatibility
 ```
 
 ## Project structure
