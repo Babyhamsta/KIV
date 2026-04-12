@@ -98,18 +98,44 @@ pip install -e .
 ```
 
 ```python
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from kiv import KIVConfig, KIVMiddleware
 
-model = AutoModelForCausalLM.from_pretrained("your-model", device_map="auto")
-tokenizer = AutoTokenizer.from_pretrained("your-model")
+# Load any HuggingFace model
+model = AutoModelForCausalLM.from_pretrained(
+    "google/gemma-4-E2B-it",
+    quantization_config=BitsAndBytesConfig(load_in_4bit=True),
+    device_map="auto",
+)
+tokenizer = AutoTokenizer.from_pretrained("google/gemma-4-E2B-it")
 
+# Install KIV with default config
 middleware = KIVMiddleware(model, KIVConfig())
 middleware.install()
-cache = middleware.create_cache()
 
+# Generate with KIV cache
+cache = middleware.create_cache()
 output = model.generate(input_ids, past_key_values=cache, use_cache=True)
+
+# For long prompts (>4K tokens), use chunked prefill
+cache = middleware.create_cache()
+logits = middleware.chunked_prefill(input_ids, cache, chunk_size=4096)
+
+# Clean up
 middleware.uninstall()
+```
+
+To tune retrieval quality vs speed, adjust `KIVConfig`:
+
+```python
+# Higher retrieval quality (more cold tokens fetched per step)
+config = KIVConfig(top_p=512, top_pages=64)
+
+# Lower VRAM usage (smaller hot cache)
+config = KIVConfig(hot_budget=1024)
+
+# Maximum retrieval (larger hot window + more cold retrieval)
+config = KIVConfig(hot_budget=4096, top_p=1024, top_pages=64)
 ```
 
 To run the benchmarks:
