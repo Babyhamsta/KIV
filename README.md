@@ -15,23 +15,25 @@ Each decode step: exact attention over hot cache, coarse page scoring on GPU (78
 
 ## Performance
 
+> **Note:** All benchmarks were measured on an Intel i7-13700K, 64GB DDR5 (6000MT/s), NVIDIA RTX 4070 (12GB VRAM). Your results will vary with different hardware — CPU-to-GPU transfer speeds and system RAM bandwidth directly affect decode latency and prefill throughput.
+
 | Context | Decode/step | tok/s | VRAM (KIV) | CPU RAM |
 |---------|-------------|-------|------------|---------|
-| 4K | 81ms | 12.3 | 12MB | 12MB |
-| 32K | 94ms | 10.6 | 12MB | 180MB |
-| 100K | 109ms | 9.2 | 12MB | 574MB |
-| 250K | 112ms | 8.9 | 12MB | 1.4GB |
-| 500K | 106ms | 9.4 | 12MB | 2.9GB |
-| 1M | 130ms | 7.7 | 12MB | 5.8GB |
+| 4K | 103ms | 9.7 | 12MB | 12MB |
+| 32K | 121ms | 8.3 | 12MB | 180MB |
+| 100K | 132ms | 7.6 | 12MB | 574MB |
+| 250K | 146ms | 6.8 | 12MB | 1.4GB |
+| 500K | 199ms | 5.0 | 12MB | 2.9GB |
+| 1M | 266ms | 3.8 | 12MB | 5.8GB |
 
-VRAM stays at 12MB regardless of context length. Model itself uses ~6.5GB. Decode is near-constant from 4K to 1M.
+VRAM stays at 12MB regardless of context length. Model itself uses ~6.5GB.
 
 Full results in [KIV-RESULTS.md](KIV-RESULTS.md).
 
 ## Strengths
 
 - **Constant VRAM:** 12MB hot cache + ~24MB page summaries. Context length has no effect on GPU memory. A 1M token conversation uses the same VRAM as a 4K one.
-- **Near-constant decode speed:** 81-130ms per token from 4K to 1M. The coarse page scoring is a small GPU matmul regardless of context size.
+- **Sub-linear decode scaling:** 103-266ms per token from 4K to 1M — a 2.6x slowdown for 250x more context. The coarse page scoring is a small GPU matmul; the remaining growth comes from CPU-to-GPU V transfers at larger cold stores.
 - **No model modification:** Drop-in middleware. Monkey-patches attention, installs a custom cache, uninstalls cleanly. Model weights are never touched.
 - **Works on consumer hardware:** RTX 4070 (12GB) runs 1M token context. Total GPU usage ~6.5GB.
 - **Strong retrieval:** 70/70 needle-in-haystack tests passed. Unique-name phonebook lookup works down to P=16 (retrieving 16 entries from 27K cold tokens).
@@ -39,7 +41,7 @@ Full results in [KIV-RESULTS.md](KIV-RESULTS.md).
 
 ## Limitations
 
-- **Bulk ingest prefill is slow:** Loading a large document (100K+ tokens) all at once takes significant time because each 4096-token chunk must be processed sequentially. 1M tokens takes ~18 minutes for prefill. This is a one-time cost per document — once prefilled, decode is fast. Typical chat conversations don't hit this because context grows incrementally.
+- **Bulk ingest prefill is slow:** Loading a large document (100K+ tokens) all at once takes significant time because each 4096-token chunk must be processed sequentially. 1M tokens takes ~4.5 minutes for prefill. This is a one-time cost per document — once prefilled, decode is fast. Typical chat conversations don't hit this because context grows incrementally.
 - **Bounded prefill loses some information:** When context exceeds the VRAM budget during prefill, early tokens are evicted to cold storage without being re-attended. This is lossless for distinctive facts (needle retrieval: 20/20) but lossy for dense similar-looking data (phonebook: depends on target position). Chat conversations are minimally affected since the most recent turns stay in hot cache.
 - **Multi-record aggregation:** Queries like "list all employees named X" need P >= number of matching records. P=256 can't aggregate 41 results from a cold store of 30K tokens.
 - **Collision disambiguation:** When multiple records share the same name, the model (not KIV) struggles to pick the right one. The base 4-bit E2B model only gets 3/6 on this task even with full exact attention.
@@ -77,7 +79,6 @@ kiv/                    # Core package
   eval_harness.py       # Built-in evaluation suite
 scripts/                # Benchmarks and test scripts
 tests/                  # Unit tests
-gla_archive/            # Archived predecessor project (GLA distillation)
 ```
 
 ## Configuration
