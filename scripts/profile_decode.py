@@ -1,10 +1,4 @@
-"""
-KIV decode pipeline profiler using CUDA events.
-
-Profiles each component of the decode step at 1M tokens to identify
-optimization targets. Uses torch.cuda.Event for precise GPU timing
-without sync overhead.
-"""
+"""KIV decode pipeline profiler using CUDA events."""
 import sys
 import os
 import io
@@ -41,7 +35,6 @@ def main():
     print("KIV Decode Pipeline Profiler (CUDA Events)")
     print("=" * 70)
 
-    # ── Load model ──
     print("Loading model (eager)...", flush=True)
     bnb = BitsAndBytesConfig(
         load_in_4bit=True,
@@ -59,7 +52,6 @@ def main():
     model.eval()
     device = next(model.parameters()).device
 
-    # ── Stream text for 1M context ──
     print("Streaming text from FineWeb-Edu...", flush=True)
     ds = load_dataset(
         "HuggingFaceFW/fineweb-edu", "sample-10BT", split="train", streaming=True
@@ -90,9 +82,6 @@ def main():
 
     config = KIVConfig(hot_budget=2048, top_p=256)
 
-    # ════════════════════════════════════════════════════
-    # 1. VANILLA BASELINE (2K context, no KIV)
-    # ════════════════════════════════════════════════════
     print("=" * 70)
     print("1. VANILLA BASELINE (2K context, eager)")
     print("=" * 70)
@@ -123,9 +112,6 @@ def main():
     gc.collect()
     torch.cuda.empty_cache()
 
-    # ════════════════════════════════════════════════════
-    # 2. KIV AT 1M — FULL DECODE STEP
-    # ════════════════════════════════════════════════════
     print(f"\n{'=' * 70}")
     print("2. KIV DECODE (1M context, eager)")
     print("=" * 70)
@@ -167,9 +153,6 @@ def main():
     print(f"\n  Full decode step: {avg_full:.2f}ms ({1000/avg_full:.1f} tok/s)")
     print(f"  KIV overhead vs vanilla: {avg_full - avg_vanilla:.2f}ms")
 
-    # ════════════════════════════════════════════════════
-    # 3. COLD RETRIEVAL BREAKDOWN (per layer)
-    # ════════════════════════════════════════════════════
     print(f"\n{'=' * 70}")
     print("3. COLD RETRIEVAL BREAKDOWN (per independent layer)")
     print("=" * 70)
@@ -185,8 +168,7 @@ def main():
         )
         cs._materialize()
 
-        # ── Coarse scoring (GPU matmul on page summaries) ──
-        coarse_times = []
+            coarse_times = []
         for _ in range(20):
             s, e = cuda_timer()
             s.record()
@@ -199,7 +181,6 @@ def main():
 
         avg_coarse = sum(coarse_times[5:]) / len(coarse_times[5:])
 
-        # ── Full retrieve_top_kv (coarse + fine + CPU fetch) ──
         full_retrieve_times = []
         for _ in range(20):
             s, e = cuda_timer()
@@ -224,9 +205,6 @@ def main():
     print(f"\n  Total cold retrieval (all layers): {total_cold_ms:.2f}ms")
     print(f"  Model forward (non-cold):          {avg_full - total_cold_ms:.2f}ms")
 
-    # ════════════════════════════════════════════════════
-    # 4. ATTENTION FUNCTION OVERHEAD
-    # ════════════════════════════════════════════════════
     print(f"\n{'=' * 70}")
     print("4. ATTENTION FUNCTION COST (concat + mask extend)")
     print("=" * 70)
@@ -258,9 +236,6 @@ def main():
 
     del hot_k, hot_v, cold_k, cold_v, mask
 
-    # ════════════════════════════════════════════════════
-    # 5. SDPA vs EAGER COMPARISON
-    # ════════════════════════════════════════════════════
     print(f"\n{'=' * 70}")
     print("5. SDPA COMPARISON")
     print("=" * 70)
@@ -314,9 +289,6 @@ def main():
 
     mw2.uninstall()
 
-    # ════════════════════════════════════════════════════
-    # SUMMARY
-    # ════════════════════════════════════════════════════
     print(f"\n{'=' * 70}")
     print("SUMMARY")
     print("=" * 70)

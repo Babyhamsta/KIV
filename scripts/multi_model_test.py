@@ -1,9 +1,4 @@
-"""
-Multi-model KIV compatibility test.
-
-Tests detect_topology + short prompt correctness + needle retrieval
-on popular 2B-3B models to verify model-agnostic behavior.
-"""
+"""Multi-model KIV compatibility test."""
 import sys
 import os
 import io
@@ -34,7 +29,6 @@ def test_model(model_id):
 
     results = {"model": model_id, "topology": None, "tests": []}
 
-    # ── Load ──
     print(f"\n  Loading {model_id}...", flush=True)
     t0 = time.perf_counter()
     try:
@@ -59,7 +53,6 @@ def test_model(model_id):
         results["tests"].append({"name": "load", "status": "SKIP", "detail": str(e)})
         return results
 
-    # ── Topology detection ──
     print(f"  Detecting topology...", flush=True)
     try:
         topo = detect_topology(model)
@@ -89,7 +82,6 @@ def test_model(model_id):
         gc.collect(); torch.cuda.empty_cache()
         return results
 
-    # ── Install KIV ──
     print(f"  Installing KIV...", flush=True)
     config = KIVConfig(hot_budget=2048, top_p=256)
     mw = KIVMiddleware(model, config)
@@ -103,7 +95,6 @@ def test_model(model_id):
         gc.collect(); torch.cuda.empty_cache()
         return results
 
-    # ── Short prompt correctness ──
     print(f"  Short prompt correctness...", flush=True)
     try:
         prompt = "What is the capital of France?"
@@ -144,7 +135,6 @@ def test_model(model_id):
 
     gc.collect(); torch.cuda.empty_cache()
 
-    # ── Generation test ──
     print(f"  Generation test...", flush=True)
     try:
         cache = mw.create_cache(device)
@@ -180,7 +170,6 @@ def test_model(model_id):
 
     gc.collect(); torch.cuda.empty_cache()
 
-    # ── Needle at 4K ──
     print(f"  Needle test (4K context)...", flush=True)
     try:
         needle = "The secret password is BLUE ELEPHANT 42."
@@ -219,7 +208,6 @@ def test_model(model_id):
         print(f"  Needle FAIL: {e}", flush=True)
         results["tests"].append({"name": "needle_4k", "status": "FAIL", "detail": str(e)})
 
-    # ── Cleanup ──
     mw.uninstall()
     del model, tokenizer
     gc.collect(); torch.cuda.empty_cache()
@@ -241,7 +229,6 @@ def main():
         r = test_model(model_id)
         all_results.append(r)
 
-    # ── Summary ──
     print(f"\n{'=' * 90}")
     print("SUMMARY")
     print("=" * 90)

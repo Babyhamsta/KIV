@@ -1,9 +1,4 @@
-"""
-Shared utilities for KIV test scripts.
-
-Centralizes model loading, generation helpers, and test data generators
-so individual scripts stay focused on their specific test logic.
-"""
+"""Shared helpers for benchmark scripts."""
 
 import io
 import os
@@ -97,8 +92,6 @@ def safe_str(text: str, max_len: int = 80) -> str:
     """ASCII-safe truncation for console output."""
     return text[:max_len].encode("ascii", errors="replace").decode("ascii")
 
-
-# ── Phonebook generator ──
 
 _FIRST_NAMES = [
     "James", "Mary", "Robert", "Patricia", "John", "Jennifer", "Michael",

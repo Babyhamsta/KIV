@@ -1,15 +1,4 @@
-"""
-Adversarial retrieval tests for KIV.
-
-Tests designed to stress the top-P retrieval mechanism beyond simple passkey lookup:
-1. Dense factual (phonebook) - similar entries in K-space
-2. Collision disambiguation - duplicate names, disambiguate by attribute
-3. Multi-needle - 10 facts scattered in context, ask about specific one
-4. Paraphrase retrieval - different wording between stored text and query
-5. Two-hop lookup - name->ID->phone requires chaining two records
-6. Reasoning over distant context - combine premises thousands of tokens apart
-7. Multi-record filter - aggregate queries over multiple matching entries
-"""
+"""Adversarial retrieval tests for KIV."""
 import gc
 import random
 import time
@@ -43,9 +32,6 @@ def main():
         print(f"    [{label}] {'PASS' if hit else 'FAIL'} ({elapsed:.1f}s, {vram_mb:.0f}MB) | {safe_str(resp)}", flush=True)
         return hit
 
-    # ══════════════════════════════════════════════════════════════
-    # TEST 1: Dense Factual (Phonebook)
-    # ══════════════════════════════════════════════════════════════
     print("\n" + "=" * 90, flush=True)
     print("TEST 1: Dense Factual (Phonebook Lookup)", flush=True)
     print("=" * 90, flush=True)
@@ -66,9 +52,6 @@ def main():
                          lambda r, exp=t['phone']: exp in r)
             mw.uninstall()
 
-    # ══════════════════════════════════════════════════════════════
-    # TEST 2: Collision Disambiguation
-    # ══════════════════════════════════════════════════════════════
     print("\n" + "=" * 90, flush=True)
     print("TEST 2: Collision Disambiguation", flush=True)
     print("=" * 90, flush=True)
@@ -116,9 +99,6 @@ def main():
             run_test(mw, q, f"Here is an employee directory:\n\n{col_phonebook}\n\nWhat is the phone number for {q}", lambda r, e=exp: e in r)
         mw.uninstall()
 
-    # ══════════════════════════════════════════════════════════════
-    # TEST 3: Multi-Needle
-    # ══════════════════════════════════════════════════════════════
     print("\n" + "=" * 90, flush=True)
     print("TEST 3: Multi-Needle (10 facts, ask about specific one)", flush=True)
     print("=" * 90, flush=True)
@@ -152,9 +132,6 @@ def main():
             run_test(mw, topic, f"Read this document carefully:\n\n{doc}\n\n{q}", lambda r, e=expected: e.lower() in r.lower())
         mw.uninstall()
 
-    # ══════════════════════════════════════════════════════════════
-    # TEST 4: Two-Hop Lookup
-    # ══════════════════════════════════════════════════════════════
     print("\n" + "=" * 90, flush=True)
     print("TEST 4: Two-Hop Lookup (name -> ID -> phone)", flush=True)
     print("=" * 90, flush=True)
@@ -180,9 +157,6 @@ def main():
         run_test(mw, f"P={top_p} two-hop", f"{doc_2hop}\n\n{q}", lambda r: target_b["phone"] in r)
         mw.uninstall()
 
-    # ══════════════════════════════════════════════════════════════
-    # TEST 5: Reasoning Over Distant Context
-    # ══════════════════════════════════════════════════════════════
     print("\n" + "=" * 90, flush=True)
     print("TEST 5: Reasoning Over Distant Context", flush=True)
     print("=" * 90, flush=True)
@@ -200,9 +174,6 @@ def main():
                  lambda r: "7" in r)
         mw.uninstall()
 
-    # ══════════════════════════════════════════════════════════════
-    # TEST 6: Multi-Record Filter
-    # ══════════════════════════════════════════════════════════════
     print("\n" + "=" * 90, flush=True)
     print("TEST 6: Multi-Record Filter", flush=True)
     print("=" * 90, flush=True)

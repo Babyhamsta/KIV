@@ -10,6 +10,7 @@ import gc
 import logging
 import sys
 import time
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -22,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 
 def _generate_with_kiv(
-    model, tokenizer, middleware: KIVMiddleware,
+    model: Any, tokenizer: Any, middleware: KIVMiddleware,
     input_ids: torch.Tensor, max_new_tokens: int = 50,
 ) -> tuple[torch.Tensor, TieredKVCache]:
     """Generate tokens using KIV middleware with manual prefill/generate split."""
@@ -70,7 +71,7 @@ def _generate_with_kiv(
     return full_ids, cache
 
 
-def test_correctness_short(model, tokenizer, middleware: KIVMiddleware) -> bool:
+def test_correctness_short(model: Any, tokenizer: Any, middleware: KIVMiddleware) -> bool:
     """
     Test 1: Short prompt (< hot_budget). Output should match vanilla exactly.
     """
@@ -112,7 +113,7 @@ def test_correctness_short(model, tokenizer, middleware: KIVMiddleware) -> bool:
     return passed
 
 
-def test_correctness_long(model, tokenizer, middleware: KIVMiddleware) -> dict:
+def test_correctness_long(model: Any, tokenizer: Any, middleware: KIVMiddleware) -> dict:
     """
     Test 2: Long prompt (> hot_budget) with P=all.
     Should closely match vanilla since we retrieve all cold entries.
@@ -202,7 +203,7 @@ def test_correctness_long(model, tokenizer, middleware: KIVMiddleware) -> dict:
     return {"max_diff": max_diff, "cos_sim": cos_sim, "kl": kl}
 
 
-def test_compression_quality(model, tokenizer, middleware: KIVMiddleware) -> dict:
+def test_compression_quality(model: Any, tokenizer: Any, middleware: KIVMiddleware) -> dict:
     """
     Test 3: Long prompt with P=256 (lossy). Measure quality degradation.
     """
@@ -286,7 +287,7 @@ def test_compression_quality(model, tokenizer, middleware: KIVMiddleware) -> dic
     return {"max_diff": max_diff, "cos_sim": cos_sim, "kl": kl, "memory": mem}
 
 
-def test_needle(model, tokenizer, middleware: KIVMiddleware) -> dict:
+def test_needle(model: Any, tokenizer: Any, middleware: KIVMiddleware) -> dict:
     """
     Test 4: Needle-in-haystack with KIV vs vanilla.
     """
@@ -340,7 +341,7 @@ def test_needle(model, tokenizer, middleware: KIVMiddleware) -> dict:
     return results
 
 
-def run_all_tests(model, tokenizer, config: KIVConfig | None = None) -> None:
+def run_all_tests(model: Any, tokenizer: Any, config: KIVConfig | None = None) -> None:
     """Run the full evaluation suite."""
     config = config or KIVConfig()
     middleware = KIVMiddleware(model, config)

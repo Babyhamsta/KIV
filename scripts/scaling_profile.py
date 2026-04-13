@@ -1,8 +1,4 @@
-"""
-KIV scaling profile: prefill, decode, and cold overhead vs context length.
-Single model load. Real text from FineWeb-Edu.
-Tests 4K -> 100K+ in one pass.
-"""
+"""KIV scaling profile: prefill, decode, and cold overhead vs context length."""
 import sys
 import os
 import time
@@ -19,7 +15,6 @@ def main():
     print("=== KIV Scaling Profile ===")
     print(f"Start: {time.strftime('%H:%M:%S')}", flush=True)
 
-    # ── Load model once ──
     print("Loading model...", flush=True)
     t0 = time.perf_counter()
     bnb_config = BitsAndBytesConfig(
@@ -46,7 +41,6 @@ def main():
     HOT_BUDGET = 2048
     NUM_DECODE_STEPS = 10  # enough to measure, not wasteful
 
-    # ── Build large token pool from FineWeb ──
     print("Streaming text from FineWeb-Edu...", flush=True)
     TARGET_TOKENS = 1_100_000  # enough for 1M context with overhead
 
@@ -73,12 +67,10 @@ def main():
     max_available = full_ids.shape[1]
     print(f"Full tokenized pool: {max_available} tokens\n", flush=True)
 
-    # ── Install middleware once ──
     config = KIVConfig(hot_budget=HOT_BUDGET, top_p=P)
     middleware = KIVMiddleware(model, config)
     middleware.install()
 
-    # ── Scaling test ──
     context_lengths = [4096, 32768, 100000, 250000, 500000, 1000000]
     PREFILL_HOT_CAP = 4096  # bounded prefill to keep VRAM stable
     results = []
@@ -102,7 +94,6 @@ def main():
         gc.collect()
         torch.cuda.empty_cache()
 
-        # ── Prefill (bounded, cap=4K to keep VRAM stable at any context length) ──
         cache = middleware.create_cache(device)
 
         torch.cuda.synchronize()
@@ -115,7 +106,6 @@ def main():
         avg_chunk = total_prefill / num_chunks * 1000
         evict_ms = 0  # eviction happens inside chunked_prefill
 
-        # ── Decode steps ──
         decode_times = []
         for step in range(NUM_DECODE_STEPS):
             next_token = last_logits.argmax(dim=-1, keepdim=True)
@@ -131,7 +121,6 @@ def main():
         avg_decode_ms = sum(decode_times) / len(decode_times) * 1000
         tok_per_s = 1000 / avg_decode_ms
 
-        # ── Cold store breakdown ──
         cold_overhead_ms = 0
         k_score_ms = 0
         topk_ms = 0
@@ -151,18 +140,16 @@ def main():
                 # Profile the full coarse-to-fine pipeline
                 torch.cuda.synchronize()
                 t = time.perf_counter()
-                top_scores, V_fetched = cs.score_and_fetch_cold(fake_q, 1.0, config)
+                cold_k, cold_v = cs.retrieve_top_kv(fake_q, 1.0, config)
                 torch.cuda.synchronize()
                 total_cold = (time.perf_counter() - t) * 1000
                 cold_overhead_ms += total_cold
                 k_score_ms += total_cold  # coarse+fine combined
-                # topk and V fetch are now inside score_and_fetch_cold
 
-                del top_scores, V_fetched, fake_q
+                del cold_k, cold_v, fake_q
 
         cold_per_layer = cold_overhead_ms / max(num_cold_layers, 1)
 
-        # ── Memory ──
         mem = cache.memory_report()
         hot_mb = mem["hot_vram_bytes"] / 1024 / 1024
         cpu_mb = mem["total_cpu_bytes"] / 1024 / 1024
@@ -197,7 +184,6 @@ def main():
 
     middleware.uninstall()
 
-    # ── Summary ──
     print(f"\n{'=' * 120}", flush=True)
     print(f"Config: hot_budget={HOT_BUDGET}, P={P}, chunk_size={CHUNK_SIZE}", flush=True)
     print(f"Decode steps per test: {NUM_DECODE_STEPS}", flush=True)

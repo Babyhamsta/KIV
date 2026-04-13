@@ -15,18 +15,6 @@ logger = logging.getLogger(__name__)
 
 
 class TieredKVCache(DynamicCache):
-    """
-    Drop-in replacement for DynamicCache that adds tiered KV management
-    for global attention layers.
-
-    Sliding layers use standard DynamicCache behavior.
-    Independent global layers use DynamicLayer with eviction to ColdKVStore
-    when the hot cache exceeds hot_budget.
-
-    Shared layers never call update() — they read from shared_kv_states
-    in the model's own forward. All global layers access cold stores
-    via get_cold_store(), which resolves shared layers to their source.
-    """
 
     def __init__(
         self,
@@ -61,15 +49,27 @@ class TieredKVCache(DynamicCache):
         return self.topology.kv_sharing_map.get(layer_idx, layer_idx)
 
     def mark_prefill_complete(self) -> None:
-        """
-        Call after the prefill forward pass to trigger initial eviction.
-
-        During prefill, we let the hot cache grow unbounded (the full prompt
-        is in VRAM anyway for the forward pass). After prefill, we evict
-        excess tokens to cold storage before generation begins.
-        """
         self._prefill_complete = True
         self._evict_excess_all_layers()
+
+    def _evict_layer(self, layer_idx: int, num_evict: int) -> None:
+        """Evict the oldest num_evict tokens from a layer's hot cache to cold.
+
+        Slices K/V, copies to cold store, crops the hot cache, and updates
+        total token tracking. Used by all eviction paths.
+        """
+        layer = self.layers[layer_idx]
+        k_evicted = layer.keys[:, :, :num_evict, :].contiguous()
+        v_evicted = layer.values[:, :, :num_evict, :].contiguous()
+
+        self.cold_stores[layer_idx].evict_from_hot(k_evicted, v_evicted)
+
+        layer.keys = layer.keys[:, :, num_evict:, :].contiguous()
+        layer.values = layer.values[:, :, num_evict:, :].contiguous()
+
+        cold_len = self.cold_stores[layer_idx].cold_length
+        hot_len = layer.keys.shape[2]
+        self._total_tokens[layer_idx] = cold_len + hot_len
 
     def _evict_to_cap(self, cap: int) -> None:
         """Evict tokens exceeding cap from global layers. Used during bounded prefill."""
@@ -81,22 +81,8 @@ class TieredKVCache(DynamicCache):
                 continue
 
             seq_len = layer.keys.shape[2]
-            if seq_len <= cap:
-                continue
-
-            num_evict = seq_len - cap
-            k_evicted = layer.keys[:, :, :num_evict, :].contiguous()
-            v_evicted = layer.values[:, :, :num_evict, :].contiguous()
-
-            self.cold_stores[layer_idx].evict_from_hot(k_evicted, v_evicted)
-
-            layer.keys = layer.keys[:, :, num_evict:, :].contiguous()
-            layer.values = layer.values[:, :, num_evict:, :].contiguous()
-
-            # Update total tokens tracking
-            cold_len = self.cold_stores[layer_idx].cold_length
-            hot_len = layer.keys.shape[2]
-            self._total_tokens[layer_idx] = cold_len + hot_len
+            if seq_len > cap:
+                self._evict_layer(layer_idx, seq_len - cap)
 
     def _evict_excess_all_layers(self) -> None:
         """Evict tokens exceeding hot_budget from all independent global layers."""
@@ -108,31 +94,15 @@ class TieredKVCache(DynamicCache):
             if not layer.is_initialized:
                 continue
 
-            seq_len = layer.keys.shape[2]  # [B, H_kv, T, D]
-            if seq_len <= budget:
-                continue
-
-            num_evict = seq_len - budget
-            # Evict oldest tokens
-            k_evicted = layer.keys[:, :, :num_evict, :].contiguous()
-            v_evicted = layer.values[:, :, :num_evict, :].contiguous()
-
-            self.cold_stores[layer_idx].evict_from_hot(k_evicted, v_evicted)
-
-            # Crop hot cache to budget
-            layer.keys = layer.keys[:, :, num_evict:, :].contiguous()
-            layer.values = layer.values[:, :, num_evict:, :].contiguous()
-
-            # Keep total_tokens consistent
-            cold_len = self.cold_stores[layer_idx].cold_length
-            hot_len = layer.keys.shape[2]
-            self._total_tokens[layer_idx] = cold_len + hot_len
-
-            logger.debug(
-                "Layer %d: evicted %d tokens to cold (hot=%d, cold=%d)",
-                layer_idx, num_evict, budget,
-                self.cold_stores[layer_idx].cold_length,
-            )
+            seq_len = layer.keys.shape[2]
+            if seq_len > budget:
+                num_evict = seq_len - budget
+                self._evict_layer(layer_idx, num_evict)
+                logger.debug(
+                    "Layer %d: evicted %d tokens to cold (hot=%d, cold=%d)",
+                    layer_idx, num_evict, budget,
+                    self.cold_stores[layer_idx].cold_length,
+                )
 
     def update(
         self,
@@ -142,20 +112,8 @@ class TieredKVCache(DynamicCache):
         *args,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Override DynamicCache.update with eviction for global layers.
-
-        For independent global layers:
-          1. Concatenate new K,V via parent update()
-          2. If past prefill and hot > budget: evict oldest to cold
-          3. Return hot-only K,V
-
-        For all other layers: delegate entirely to parent.
-        """
-        # Standard update (concatenate)
         keys, values = super().update(key_states, value_states, layer_idx, *args, **kwargs)
 
-        # Track total tokens and increment decode step on first independent layer
         if layer_idx in self.topology.independent_kv_layers:
             if (
                 self._prefill_complete
@@ -177,24 +135,9 @@ class TieredKVCache(DynamicCache):
             budget = self.kiv_config.hot_budget
 
             if seq_len > budget:
-                num_evict = seq_len - budget
-                k_evicted = layer.keys[:, :, :num_evict, :].contiguous()
-                v_evicted = layer.values[:, :, :num_evict, :].contiguous()
-
-                self.cold_stores[layer_idx].evict_from_hot(k_evicted, v_evicted)
-
-                # Crop hot to budget
-                layer.keys = layer.keys[:, :, num_evict:, :].contiguous()
-                layer.values = layer.values[:, :, num_evict:, :].contiguous()
-
-                # Return cropped tensors
+                self._evict_layer(layer_idx, seq_len - budget)
                 keys = layer.keys
                 values = layer.values
-
-                # Update total count
-                self._total_tokens[layer_idx] = (
-                    self.cold_stores[layer_idx].cold_length + keys.shape[2]
-                )
 
         return keys, values
 
@@ -211,14 +154,6 @@ class TieredKVCache(DynamicCache):
         return None
 
     def get_mask_sizes(self, query_length: int, layer_idx: int) -> tuple[int, int]:
-        """
-        Override mask sizing for global layers after eviction.
-
-        After eviction, the hot cache contains the most recent tokens,
-        not tokens starting at position 0. The kv_offset must equal
-        cold_length so the causal mask correctly maps KV columns to
-        their real sequence positions.
-        """
         cold_store = self.get_cold_store(layer_idx)
         source_layer_idx = self._kv_source_layer_idx(layer_idx)
         if cold_store is not None and source_layer_idx < len(self.layers):
@@ -233,13 +168,7 @@ class TieredKVCache(DynamicCache):
         return super().get_mask_sizes(query_length, layer_idx)
 
     def get_seq_length(self, layer_idx: int = 0) -> int:
-        """
-        Return total sequence length (hot + cold) for position tracking.
-
-        HF uses this to compute position_ids for new tokens. We must
-        return the full count so positions are correct even after eviction.
-        """
-        # For global layers with cold storage, return total
+        """Returns hot + cold length so position_ids stay correct."""
         if layer_idx in self._total_tokens:
             return self._total_tokens[layer_idx]
 

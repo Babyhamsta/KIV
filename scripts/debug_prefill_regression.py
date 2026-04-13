@@ -1,7 +1,4 @@
-"""
-Debug why prefill regressed from 304s to 1067s at 1M tokens.
-Profile what happens inside each chunk during bounded prefill.
-"""
+"""Debug prefill performance regression at 1M tokens."""
 import gc
 import sys
 import time
@@ -47,7 +44,6 @@ def main():
     CHUNK_SIZE = 4096
     num_chunks = (ctx_len + CHUNK_SIZE - 1) // CHUNK_SIZE
 
-    # ── Test 1: Measure evict_from_hot cost in isolation ──
     print("=== Test 1: evict_from_hot timing ===", flush=True)
     config = KIVConfig(hot_budget=2048, top_p=256, page_size=128, top_pages=32)
     middleware = KIVMiddleware(model, config)
@@ -95,7 +91,6 @@ def main():
     middleware.uninstall()
     del cache
 
-    # ── Test 2: Profile inside evict_from_hot ──
     print(f"\n=== Test 2: Breakdown inside evict_from_hot ===", flush=True)
 
     from kiv.cold_store import ColdKVStore
@@ -192,7 +187,6 @@ def main():
     print(f"    Partial trim (.contiguous()): avg={sum(times_trim)/len(times_trim):.2f}ms total={sum(times_trim):.1f}ms", flush=True)
     print(f"    Total across {len(times_summary)} pages: {sum(times_summary)+sum(times_cpu_transfer)+sum(times_cat_cpu)+sum(times_trim):.1f}ms", flush=True)
 
-    # ── Test 3: Compare with old brute-force eviction (no pages) ──
     print(f"\n=== Test 3: Old-style eviction (no page construction) ===", flush=True)
 
     fake_k = torch.randn(

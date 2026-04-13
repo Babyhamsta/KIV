@@ -1,19 +1,10 @@
-"""
-KIV: K-Indexed V Materialization for HuggingFace transformers.
+"""KIV: K-Indexed V Materialization."""
 
-Replaces the standard KV cache for global attention layers with a tiered
-system that keeps K indexed for fast lookup and V on CPU for on-demand
-retrieval. No model weights are modified. Works with any HF model that
-uses DynamicCache.
-"""
-
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 from .config import KIVConfig
 from .cold_store import ColdKVStore
-from .model_topology import ModelTopology, detect_topology
-from .tiered_cache import TieredKVCache
-from .middleware import KIVMiddleware
+from .model_topology import ModelTopology
 
 __all__ = [
     "KIVConfig",
@@ -23,3 +14,22 @@ __all__ = [
     "TieredKVCache",
     "KIVMiddleware",
 ]
+
+
+def __getattr__(name: str):
+    if name == "detect_topology":
+        from .hf_topology import detect_topology
+
+        globals()["detect_topology"] = detect_topology
+        return detect_topology
+    if name == "TieredKVCache":
+        from .tiered_cache import TieredKVCache
+
+        globals()["TieredKVCache"] = TieredKVCache
+        return TieredKVCache
+    if name == "KIVMiddleware":
+        from .middleware import KIVMiddleware
+
+        globals()["KIVMiddleware"] = KIVMiddleware
+        return KIVMiddleware
+    raise AttributeError(f"module 'kiv' has no attribute {name!r}")

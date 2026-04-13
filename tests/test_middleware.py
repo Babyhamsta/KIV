@@ -101,3 +101,36 @@ def test_chunked_prefill_falls_back_for_unsupported_models():
     assert model.calls == 3
     assert logits.shape == (1, 3)
     assert cache.marked is True
+
+
+def test_chunked_prefill_does_not_empty_cache_by_default(monkeypatch):
+    model = _ModelWithLogitsToKeep()
+    middleware = _middleware_for_chunked_prefill(model)
+    cache = _FakeCache()
+    calls = []
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.append(True))
+
+    middleware.chunked_prefill(
+        torch.ones(1, 10, dtype=torch.long),
+        cache,
+        chunk_size=1,
+    )
+
+    assert calls == []
+
+
+def test_chunked_prefill_empty_cache_interval_is_opt_in(monkeypatch):
+    model = _ModelWithLogitsToKeep()
+    middleware = _middleware_for_chunked_prefill(model)
+    cache = _FakeCache()
+    calls = []
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.append(True))
+
+    middleware.chunked_prefill(
+        torch.ones(1, 5, dtype=torch.long),
+        cache,
+        chunk_size=1,
+        empty_cache_interval=2,
+    )
+
+    assert calls == [True, True]

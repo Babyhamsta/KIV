@@ -77,7 +77,6 @@ def main():
             middleware.install()
             topology = middleware.topology
 
-            # ── Phase 1: Chunked Prefill ──
             cache = middleware.create_cache(device)
             num_chunks = (actual_len + CHUNK_SIZE - 1) // CHUNK_SIZE
 
@@ -103,7 +102,6 @@ def main():
                     last_logits = outputs.logits[:, -1, :]
                 del outputs
 
-            # ── Phase 2: Eviction ──
             def do_eviction():
                 cache.mark_prefill_complete()
 
@@ -117,7 +115,6 @@ def main():
                           f"pages={cs.num_pages}, finalized={cs._num_finalized}",
                           flush=True)
 
-            # ── Phase 3: Decode steps ──
             decode_times = []
             for step in range(5):
                 next_token = last_logits.argmax(dim=-1, keepdim=True)
@@ -134,7 +131,6 @@ def main():
                 last_logits = outputs.logits[:, -1, :]
                 del outputs
 
-            # ── Phase 4: Breakdown of a single decode step ──
             print(f"\n  --- Decode step breakdown (step 6) ---", flush=True)
             next_token = last_logits.argmax(dim=-1, keepdim=True)
 

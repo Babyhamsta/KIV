@@ -141,7 +141,6 @@ def main():
             gc.collect()
             return None, f"OOM: {e}", {}
 
-    # ── Phase 1: Vanilla baseline ──
     print(f"\n{'=' * 90}", flush=True)
     print(f"PHASE 1: Vanilla baseline ({len(vanilla_lengths) * len(depths)} tests, max ctx={VANILLA_MAX_CTX})", flush=True)
     print(f"{'=' * 90}", flush=True)
@@ -161,7 +160,6 @@ def main():
     phase_elapsed = time.perf_counter() - phase_t0
     print(f"  Phase 1 done in {phase_elapsed:.0f}s", flush=True)
 
-    # ── Phase 2: KIV at each P value ──
     kiv_results = {}  # (p, ctx_len, depth) -> hit
 
     for top_p in p_values:
@@ -194,7 +192,6 @@ def main():
         print(f"  P={top_p} done in {phase_elapsed:.0f}s", flush=True)
         middleware.uninstall()
 
-    # ── Summary Grid ──
     total_elapsed = time.perf_counter() - t0
     print(f"\n{'=' * 90}", flush=True)
     print(f"SUMMARY GRID  (total time: {total_elapsed:.0f}s)", flush=True)

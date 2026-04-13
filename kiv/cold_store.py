@@ -178,8 +178,6 @@ class ColdKVStore:
             self._partial_k = self._partial_k[:, :, self._page_size:, :].contiguous()
             self._partial_v = self._partial_v[:, :, self._page_size:, :].contiguous()
 
-    # ── Vectorized candidate selection ──
-
     def _select_candidates(
         self, query: torch.Tensor, scaling: float, kiv_config: KIVConfig
     ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
@@ -259,7 +257,6 @@ class ColdKVStore:
 
         return candidate_k, candidate_v, candidate_idx
 
-    # ─�� Primary retrieval: returns K and V for concatenation ──
 
     def retrieve_top_kv(
         self,
@@ -331,106 +328,6 @@ class ColdKVStore:
 
         return k_out, v_out
 
-    # ── Legacy method (kept for backward compat) ──
-
-    def score_and_fetch_cold(
-        self, query: torch.Tensor, scaling: float, config: KIVConfig
-    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[None, None]:
-        """Deprecated: use retrieve_top_kv() instead."""
-        if self.cold_length == 0:
-            return None, None
-
-        self._materialize()
-
-        B = query.shape[0]
-        H_q = query.shape[1]
-        Q = query.shape[2]
-        P = min(config.top_p, self.cold_length)
-
-        candidate_k, _, candidate_idx = self._select_candidates(
-            query, scaling, config
-        )
-        if candidate_k is None:
-            return None, None
-
-        all_top_scores = []
-        all_V_fetched = []
-
-        for b in range(B):
-            fine_k_exp = _repeat_kv(candidate_k[b:b+1], self._num_kv_groups)
-            fine_scores = torch.matmul(
-                query[b:b+1], fine_k_exp.transpose(-2, -1)
-            ) * scaling
-
-            actual_P = min(P, fine_scores.shape[-1])
-            top_vals, top_local_idx = fine_scores.topk(actual_P, dim=-1)
-
-            if actual_P < P:
-                pad_size = P - actual_P
-                top_vals = torch.nn.functional.pad(
-                    top_vals, (0, pad_size), value=float("-inf")
-                )
-                top_local_idx = torch.nn.functional.pad(
-                    top_local_idx, (0, pad_size), value=0
-                )
-            all_top_scores.append(top_vals)
-
-            # Map to global indices — GPU tensor indexing
-            global_top_idx = candidate_idx[top_local_idx.reshape(-1)].reshape(
-                top_local_idx.shape
-            )
-            V_b = self._fetch_v_for_indices_legacy(
-                b, global_top_idx.squeeze(0), P
-            )
-            all_V_fetched.append(V_b)
-
-            del fine_k_exp, fine_scores
-
-        top_scores = torch.cat(all_top_scores, dim=0)
-        V_fetched = torch.cat(all_V_fetched, dim=0)
-        return top_scores, V_fetched
-
-    def _fetch_v_for_indices_legacy(
-        self, batch_idx: int, indices: torch.Tensor, P: int
-    ) -> torch.Tensor:
-        """Legacy V fetch returning [1, H_q, Q, P, D] with head expansion."""
-        H_q, Q, _ = indices.shape
-        D = self._head_dim
-
-        flat_idx = indices.reshape(-1)
-        unique_idx, inverse = flat_idx.unique(return_inverse=True)
-        unique_cpu = unique_idx.cpu()
-
-        finalized_mask = unique_cpu < self._num_finalized
-        finalized_idx = unique_cpu[finalized_mask]
-        partial_idx = unique_cpu[~finalized_mask] - self._num_finalized
-
-        parts = []
-        part_order = []
-
-        if finalized_idx.numel() > 0:
-            v_batch_cpu = self._v_store[batch_idx, 0, finalized_idx, :]
-            v_batch_gpu = self._copy_to_store_device(v_batch_cpu)
-            parts.append(v_batch_gpu)
-            part_order.append(finalized_mask)
-
-        if partial_idx.numel() > 0:
-            partial_idx_gpu = partial_idx.to(self.device)
-            v_partial = self._partial_v[batch_idx, 0, partial_idx_gpu, :]
-            parts.append(v_partial)
-            part_order.append(~finalized_mask)
-
-        dtype = (self._v_store.dtype if self._v_store is not None
-                 else (self._partial_v.dtype if self._partial_v is not None
-                       else torch.bfloat16))
-        v_unique = torch.empty(
-            unique_idx.shape[0], D, device=self.device, dtype=dtype
-        )
-        for tensor, mask in zip(parts, part_order):
-            v_unique[mask.to(self.device)] = tensor
-
-        v_expanded = v_unique[inverse]
-        return v_expanded.view(1, H_q, Q, P, D)
 
     def reset(self) -> None:
         """Clear all cold storage."""

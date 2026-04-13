@@ -1,12 +1,4 @@
-"""
-KIV Middleware: installs tiered KV cache into any HuggingFace transformer
-without modifying model weights or attention forwards.
-
-Uses two model-agnostic hooks:
-  1. TieredKVCache (extends DynamicCache) — handles hot storage + cold eviction
-  2. Custom attention function — retrieves cold K/V, concatenates, delegates
-     to standard attention (sdpa/flash/eager)
-"""
+"""KIV Middleware for HuggingFace transformers."""
 
 from __future__ import annotations
 
@@ -19,13 +11,12 @@ from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from .config import KIVConfig
-from .model_topology import ModelTopology, detect_topology, _find_text_model
+from .mask_utils import extend_mask_for_cold
+from .model_topology import ModelTopology
+from .hf_topology import detect_topology, _find_text_model
 from .tiered_cache import TieredKVCache
 
 logger = logging.getLogger(__name__)
-
-
-# ── Mask extension helper ──
 
 
 def _prefill_logits_kwargs(model: Any, logits_to_keep: int = 1) -> dict[str, int]:
@@ -46,55 +37,10 @@ def _prefill_logits_kwargs(model: Any, logits_to_keep: int = 1) -> dict[str, int
     return {}
 
 
-def _extend_mask_for_cold(
-    mask: torch.Tensor, num_cold: int
-) -> torch.Tensor:
-    """Prepend columns to attention mask for cold tokens (all attendable).
-
-    Handles multiple mask conventions:
-      - Float masks (additive): 0.0 = attend, -inf = ignore → prepend 0.0
-      - Bool masks: True = attend → prepend True
-      - 2D masks [B, KV] or 4D masks [B, H, Q, KV]
-    """
-    if mask.dtype == torch.bool:
-        fill_value = True
-    else:
-        fill_value = 0.0
-
-    if mask.ndim == 2:
-        # [B, KV] → prepend along last dim
-        cold_cols = mask.new_full((mask.shape[0], num_cold), fill_value)
-    elif mask.ndim == 4:
-        # [B, H, Q, KV] → prepend along last dim
-        cold_cols = mask.new_full(
-            (mask.shape[0], mask.shape[1], mask.shape[2], num_cold),
-            fill_value,
-        )
-    else:
-        # Unknown shape — try prepending on last dim
-        shape = list(mask.shape)
-        shape[-1] = num_cold
-        cold_cols = mask.new_full(shape, fill_value)
-
-    return torch.cat([cold_cols, mask], dim=-1)
+_extend_mask_for_cold = extend_mask_for_cold
 
 
 class KIVMiddleware:
-    """
-    Installs K-Indexed V Materialization into any HuggingFace transformer.
-
-    Does not modify model weights or attention forward functions. Instead:
-    1. Registers a custom attention function that augments hot K/V with
-       cold retrievals before delegating to standard attention.
-    2. Provides TieredKVCache as a drop-in for DynamicCache.
-
-    Usage:
-        middleware = KIVMiddleware(model, config)
-        middleware.install()
-        cache = middleware.create_cache()
-        output = model.generate(..., past_key_values=cache)
-        middleware.uninstall()
-    """
 
     def __init__(
         self,
@@ -215,6 +161,7 @@ class KIVMiddleware:
         cache: TieredKVCache,
         chunk_size: int = 4096,
         prefill_hot_cap: int | None = None,
+        empty_cache_interval: int | None = None,
     ) -> torch.Tensor:
         """
         Process a long prompt in chunks to avoid quadratic attention OOM.
@@ -228,6 +175,10 @@ class KIVMiddleware:
                 attended during prefill (evict-only, no retrieval).
                 This bounds VRAM at the cost of losing exact attention to
                 early tokens. If None, hot cache grows unbounded.
+            empty_cache_interval: optional chunk interval for forcing
+                ``torch.cuda.empty_cache()`` during prefill. Disabled by
+                default because it stalls CUDA and does not free live cache
+                tensors.
 
         Returns:
             logits for the last token: [B, vocab_size]
@@ -272,8 +223,11 @@ class KIVMiddleware:
                 if prefill_hot_cap is not None:
                     cache._evict_to_cap(prefill_hot_cap)
 
-                # Periodic VRAM cleanup to prevent fragmentation
-                if i % 8 == 7:
+                if (
+                    empty_cache_interval is not None
+                    and empty_cache_interval > 0
+                    and (i + 1) % empty_cache_interval == 0
+                ):
                     torch.cuda.empty_cache()
         finally:
             # Always restore KIV attention wrapper, even on exception
@@ -289,8 +243,6 @@ class KIVMiddleware:
 
         return logits
 
-    # ── Attention function registration ──
-
     def _resolve_attn_impl(self) -> str:
         """Get the model's current attention implementation name."""
         config = self.model.config
@@ -298,7 +250,7 @@ class KIVMiddleware:
             config = config.text_config
         return getattr(config, "_attn_implementation", "eager")
 
-    def _get_attn_fn(self, impl: str):
+    def _get_attn_fn(self, impl: str) -> Any:
         """Get the attention function for a given implementation."""
         if impl in ALL_ATTENTION_FUNCTIONS:
             return ALL_ATTENTION_FUNCTIONS[impl]
@@ -324,7 +276,7 @@ class KIVMiddleware:
             config.text_config._attn_implementation = impl
         config._attn_implementation = impl
 
-    def _make_kiv_attention(self, original_fn):
+    def _make_kiv_attention(self, original_fn: Any) -> Any:
         """Build the KIV attention wrapper that augments with cold retrievals."""
         kiv_config = self.config
 

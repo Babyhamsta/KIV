@@ -7,14 +7,14 @@
 
 ## Method
 
-Replaces the standard KV cache for the 7 global attention layers in Gemma 4 E2B with a tiered retrieval system. The model's own attention code runs unmodified — KIV operates through the HuggingFace cache interface and a custom attention function that concatenates retrieved cold K/V with hot K/V before standard attention.
+Tiered KV cache on the 7 global attention layers. 28 sliding-window layers untouched, model weights unmodified.
 
-- **Hot cache (VRAM):** Last 2048 tokens with exact K+V for standard attention
-- **Page summaries (VRAM):** Mean K vector per 128-token page for coarse scoring
-- **K pages (CPU):** Per-token K vectors in pinned memory, fetched only for top pages
-- **V store (CPU):** Per-token V vectors in pinned memory, fetched only for top-P tokens
+- **Hot (VRAM):** Last 2048 tokens, exact K+V
+- **Page summaries (VRAM):** Mean K per 128-token page for coarse scoring
+- **K pages (CPU):** Per-token K, fetched for top-32 pages
+- **V store (CPU):** Per-token V, fetched for top-256 tokens
 
-Per decode step: coarse page scoring on GPU, fine scoring of top-32 pages' K, fetch top-256 K/V from CPU, concatenate with hot K/V, standard attention over 2304 tokens. No model weights modified. 28 sliding-window layers untouched.
+Per decode step: coarse page scoring → fine K scoring → fetch top-P K/V from CPU → concatenate with hot → attention over 2304 tokens.
 
 ## Scaling Profile
 
@@ -61,7 +61,7 @@ P=16 and P=64 retrieve correctly up to 14.5K tokens. At 29K tokens, P=256 is nee
 | Kevin Ramirez hired 2022 | FAIL | FAIL | FAIL |
 | Mary Smith in Finance | FAIL | FAIL | FAIL |
 
-0/12 across all P values. The 4-bit E2B model cannot disambiguate duplicate names by secondary attributes even with exact attention. This is a model limitation, not a retrieval limitation.
+0/12 across all P values. The 4-bit E2B model cannot disambiguate duplicate names by secondary attributes even with exact attention (vanilla also fails this).
 
 ## Multi-Needle (10 Facts Scattered in Context)
 
@@ -75,14 +75,12 @@ P=16 and P=64 retrieve correctly up to 14.5K tokens. At 29K tokens, P=256 is nee
 
 ## Two-Hop and Aggregation
 
-- **Two-hop lookup (name->ID->phone):** FAIL at all P values. Model finds the ID but does not chain to the phone lookup. This is a model reasoning limitation, not a retrieval limitation.
+- **Two-hop lookup (name->ID->phone):** FAIL at all P values. Model finds the ID but does not chain to the phone lookup (vanilla also fails).
 - **Distant context reasoning:** PASS at all P values. Two premises separated by thousands of tokens are correctly combined (employee ID 4821 -> 7th floor).
 - **Multi-record filter:** Kevin Ramirez count (4 entries): 3/3 PASS. Full Ramirez count (47 entries): 0/3 FAIL — requires P >= matching record count.
 
-## Observations
+## Summary
 
-**Retrieval:** Single-record lookup with unique keys works reliably at P=64 up to 14.5K tokens and at P=256 up to 29K tokens. Multi-needle retrieval of distinctive facts works at P=16. VRAM bounded at 12MB from 4K to 1M. Prefill at 1M takes ~4.3 minutes (one-time cost).
+Single-record lookup works at P=64 up to 14.5K tokens, P=256 up to 29K. Multi-needle with distinctive facts works at P=16. VRAM fixed at 12MB from 4K to 1M. Prefill at 1M takes ~4.3 minutes.
 
-**KIV limitations:** Multi-record aggregation requires P >= matching record count. Collision disambiguation does not work — the base model itself struggles with this task.
-
-**Model limitations (not KIV-related):** Two-hop reasoning fails at all P values. Collision disambiguation fails even with full exact attention. These reflect 4-bit 2B parameter model constraints, not cache behavior.
+Multi-record aggregation needs P >= matching record count. Collision disambiguation and two-hop reasoning fail regardless of P — vanilla model also fails these (4-bit 2B model constraint).

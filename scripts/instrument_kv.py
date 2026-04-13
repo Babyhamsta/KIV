@@ -1,19 +1,4 @@
-"""
-Instrument Gemma 4 E2B original model to dump per-layer KV statistics
-for global (full) attention layers.
-
-Captures:
-  1. Raw K, V tensors (after projection + norm + RoPE, before attention)
-  2. SVD spectra (singular values, cumulative explained variance)
-  3. Per-head cosine similarity (K redundancy across heads)
-  4. Temporal deltas (||K_t - K_{t-1}|| and ||V_t - V_{t-1}||)
-  5. Attention weight statistics (mean/max per token)
-  6. Low-rank reconstruction error (rank 32/64/128)
-
-Usage:
-    python scripts/instrument_kv.py --seq-len 8192
-    python scripts/instrument_kv.py --seq-len 8192 --output-dir kv_analysis
-"""
+"""Dump per-layer KV statistics for global attention layers."""
 
 import argparse
 import gc
@@ -40,7 +25,6 @@ def parse_args():
     return p.parse_args()
 
 
-# ── Global attention layer indices in Gemma 4 E2B ──
 # 4:1 sliding:full pattern, layers [4, 9, 14, 19, 24, 29, 34]
 # Layers 19+ are KV-shared (reuse from layer 14), so only 4, 9, 14
 # have independent K/V projections.

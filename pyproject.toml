@@ -4,15 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kiv"
-version = "0.1.0"
-description = "K-Indexed V Materialization — extend any HuggingFace transformer's context to 1M+ tokens on a consumer GPU"
+version = "0.2.0"
+description = "K-Indexed V Materialization — extend LLM context to 1M+ tokens on a consumer GPU"
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.10"
 authors = [
     { name = "Babyhamsta" },
 ]
-keywords = ["transformers", "kv-cache", "long-context", "attention", "llm"]
+keywords = ["transformers", "vllm", "kv-cache", "long-context", "attention", "llm"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -25,10 +25,15 @@ classifiers = [
 ]
 dependencies = [
     "torch>=2.1.0",
-    "transformers>=5.5.0",
 ]
 
 [project.optional-dependencies]
+hf = [
+    "transformers>=5.5.0",
+]
+vllm = [
+    "vllm>=0.11.0",
+]
 quantization = [
     "bitsandbytes>=0.43.0",
     "accelerate>=0.25.0",
@@ -38,7 +43,7 @@ test = [
     "datasets>=2.14.0",
 ]
 all = [
-    "kiv[quantization,test]",
+    "kiv[hf,quantization,test]",
     "tqdm>=4.65.0",
     "numpy>=1.24.0",
 ]

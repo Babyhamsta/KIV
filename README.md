@@ -1,14 +1,31 @@
-# KIV: K-Indexed V Materialization
+# KIV: Long Context for Local LLMs
 
-Middleware that extends any HuggingFace transformer's context window to 1M+ tokens on a consumer GPU by replacing the standard KV cache with a tiered retrieval system. No model weights are modified. Tested on Gemma 4 E2B, Qwen2.5, TinyLlama, and Phi-3.5 across MQA, GQA, and MHA architectures.
+When you run a local LLM, the GPU has to hold the entire conversation in memory. The longer the conversation gets, the more VRAM it eats — and on a 12GB card you'll hit "out of memory" after a few thousand tokens. KIV fixes this by moving older parts of the conversation to system RAM and only pulling back the pieces the model actually needs for each token. The GPU memory stays flat no matter how long the conversation gets.
+
+- 1M+ token context on a single RTX 4070 (12GB VRAM), constant 12MB cache footprint
+- Works with any HuggingFace model — no retraining, no model changes
+- 70/70 needle-in-haystack retrieval tests passed
+- Installs and uninstalls cleanly, no model weights modified
+
+Tested on Gemma 4 E2B, Qwen2.5, TinyLlama, and Phi-3.5 across MQA, GQA, and MHA architectures.
+
+## Comparison
+
+| Approach | Context handling | Trade-off |
+|----------|-----------------|-----------|
+| Default HuggingFace | Everything in VRAM | OOM at ~8K tokens on 12GB GPU |
+| Quantization (4-bit, GGUF) | Shrinks model to free VRAM | Context still scales linearly |
+| Sliding window | Drops tokens outside window | Old context gone permanently |
+| Cloud APIs | Server-side | Data leaves your machine |
+| **KIV** | CPU RAM + retrieval | 1M tokens on 12GB GPU, slower at long contexts |
 
 ## How it works
 
-KIV replaces the standard KV cache for global attention layers with a page-based tiered system. The model's own attention code runs unmodified — KIV operates entirely through the HuggingFace cache interface and a thin attention function wrapper.
+KIV replaces the KV cache for global attention layers with a page-based tiered system. The model's own attention code runs unmodified.
 
-### Why it works: K/V asymmetry
+### K/V asymmetry
 
-The key insight behind KIV is that K and V vectors have fundamentally different properties. K vectors are smooth and structurally regular — tokens about similar topics produce similar K vectors, which means K space is indexable. A page summary (mean K over 128 tokens) retains enough signal to identify which pages are relevant to a query. V vectors are high-entropy and carry the actual content the model reads from — they resist summarization and must be retrieved exactly. KIV exploits this asymmetry: K vectors are indexed and scored cheaply on GPU via page summaries, while V vectors are stored in full on CPU and fetched only for the tokens that score highest. This avoids the impossible choice between compressing everything (lossy) and keeping everything in VRAM (expensive).
+K vectors are smooth and structurally regular — tokens about similar topics produce similar K vectors, so K space is indexable. A page summary (mean K over 128 tokens) retains enough signal to identify relevant pages. V vectors are high-entropy and must be retrieved exactly. KIV indexes K cheaply on GPU via page summaries and fetches V from CPU only for the tokens that score highest.
 
 ### Architecture
 
@@ -34,11 +51,9 @@ flowchart TB
 3. **K pages (CPU):** Per-token K vectors on CPU. Only the top-32 pages selected by the coarse pass get transferred to GPU each decode step
 4. **V store (CPU):** Per-token V vectors on CPU. Only the top-256 tokens from the fine pass get fetched
 
-The sliding-window layers are untouched — KIV only manages global attention layers.
+Sliding-window layers are untouched.
 
 ### Decode step
-
-Each token generation follows this coarse-to-fine retrieval pipeline:
 
 ```mermaid
 flowchart TD
@@ -57,7 +72,7 @@ flowchart TD
 
 ## Performance
 
-> **Note:** All benchmarks were measured on an Intel i7-13700K, 64GB DDR5 (6000MT/s), NVIDIA RTX 4070 (12GB VRAM). Your results will vary with different hardware — CPU-to-GPU transfer speeds and system RAM bandwidth directly affect decode latency and prefill throughput.
+Benchmarks on Intel i7-13700K, 64GB DDR5 (6000MT/s), RTX 4070 (12GB VRAM).
 
 | Context | Decode/step | tok/s | VRAM (KIV) | CPU RAM |
 |---------|-------------|-------|------------|---------|
@@ -74,21 +89,20 @@ Full results in [KIV-RESULTS.md](KIV-RESULTS.md).
 
 ## Strengths
 
-- **Constant VRAM:** 12MB hot cache + ~24MB page summaries. Context length has no effect on GPU memory. A 1M token conversation uses the same VRAM as a 4K one.
-- **Sub-linear decode scaling:** 77-243ms per token from 4K to 1M — a 3.2x slowdown for 250x more context. The coarse page scoring is a small GPU matmul; the remaining growth comes from CPU-to-GPU V transfers at larger cold stores.
-- **No model modification:** Drop-in middleware. Registers a custom cache and attention function, uninstalls cleanly. Model weights and forwards are never touched.
-- **Works on consumer hardware:** RTX 4070 (12GB) runs 1M token context. Total GPU usage ~6.5GB.
-- **Strong retrieval:** 70/70 needle-in-haystack tests passed. Unique-name phonebook lookup works at P=64 up to 14.5K tokens and at P=256 up to 29K tokens.
-- **Chat-friendly:** In a typical multi-turn chat, context grows gradually. Each new message adds a few hundred tokens. KIV handles this with near-zero overhead — most tokens stay in the 2048-token hot cache, and the page index builds incrementally. Decode speed is unaffected by conversation history length.
+- Constant 12MB VRAM for cache at any context length
+- 77-243ms per token from 4K to 1M (3x slowdown for 250x more context)
+- No model modification, no retraining. Registers a custom cache and attention function, uninstalls cleanly
+- RTX 4070 (12GB) runs 1M token context. Total GPU usage ~6.5GB
+- 70/70 needle-in-haystack tests passed
+- Multi-turn chat adds minimal overhead since context grows gradually
 
 ## Limitations
 
-- **Bulk ingest prefill is slow:** Loading a large document (100K+ tokens) all at once takes significant time because each 4096-token chunk must be processed sequentially. 1M tokens takes ~4.3 minutes for prefill. This is a one-time cost per document — once prefilled, decode is fast. Typical chat conversations don't hit this because context grows incrementally.
-- **Bounded prefill loses some information:** When context exceeds the VRAM budget during prefill, early tokens are evicted to cold storage without being re-attended. This is lossless for distinctive facts (needle retrieval: 20/20) but lossy for dense similar-looking data (phonebook: depends on target position). Chat conversations are minimally affected since the most recent turns stay in hot cache.
-- **Multi-record aggregation:** Queries like "list all employees named X" need P >= number of matching records. P=256 can't aggregate 41 results from a cold store of 30K tokens.
-- **Collision disambiguation:** When multiple records share the same name, the model cannot disambiguate by secondary attributes. The base 4-bit E2B model struggles with this task regardless of attention mechanism.
-- **Two-hop reasoning:** The model can't chain lookups (find ID, then use ID to find phone). This is a model reasoning limitation, not a cache limitation.
-- **CPU RAM scales linearly:** K and V vectors for all cold tokens live in CPU RAM. At 1M tokens: ~5.8GB. Systems with limited RAM will cap out before GPU does.
+- Bulk prefill is slow: 1M tokens takes ~4.3 minutes. One-time cost per document
+- Retrieval accuracy drops on dense repetitive data (phone books). Distinct facts retrieve reliably
+- Can't aggregate many scattered results. P=256 won't find 41 matches across 30K tokens
+- Can't chain multi-step lookups (find X, then use X to find Y). Model reasoning limitation
+- CPU RAM scales linearly: ~5.8GB at 1M tokens
 
 ## Quick start
 
@@ -161,13 +175,17 @@ kiv/                    # Core package
   middleware.py          # Installs KIV via cache + attention function registration
   eval_utils.py         # Needle-in-haystack test utilities
   eval_harness.py       # Built-in evaluation suite
+  vllm/                 # vLLM integration (EXPERIMENTAL — not yet tested/validated)
+    connector.py        # KV Connector V1 plugin
+    attention_hook.py   # Cold retrieval via two-pass attention
+    topology.py         # Topology detection from vLLM config
 scripts/                # Benchmarks and test scripts
 tests/                  # Unit tests
 ```
 
 ## Configuration
 
-KIV has four tunable parameters. Model architecture (layer indices, head counts, KV sharing) is auto-detected — you only configure the algorithm.
+KIV has four tunable parameters. Model architecture is auto-detected.
 
 ```python
 from kiv import KIVConfig, KIVMiddleware
@@ -190,11 +208,11 @@ cache = middleware.create_cache()
 | `page_size` | 128 | Tokens per page in the cold store. Each page gets one summary vector (mean K). Smaller pages give finer-grained retrieval but more summaries to score. |
 | `top_pages` | 32 | Pages selected in the coarse scoring pass. Their K vectors are fetched from CPU for fine scoring. Higher values widen the candidate pool. |
 
-**Tuning guidance:** The defaults work well for most use cases. If retrieval quality matters more than speed, increase `top_p` (e.g., 512 or 1024). If you have VRAM headroom, increasing `hot_budget` gives exact attention over more recent context. `page_size` and `top_pages` rarely need changing — the coarse-to-fine pipeline is designed so that `top_pages * page_size` (default: 4096 candidates) is large enough to contain the top-P tokens for most queries.
+Defaults work for most use cases. Increase `top_p` (512, 1024) for better retrieval recall. Increase `hot_budget` if you have VRAM headroom. `page_size` and `top_pages` rarely need changing.
 
 ## Supported models
 
-KIV auto-detects model architecture via `detect_topology()` and works with any HuggingFace model that uses `DynamicCache`. No model-specific code is needed.
+KIV auto-detects model architecture via `detect_topology()` and works with any HuggingFace model that uses `DynamicCache`.
 
 | Model | Parameters | Attention | KV Heads | Tested | Notes |
 |-------|-----------|-----------|----------|--------|-------|
@@ -207,7 +225,7 @@ KIV auto-detects model architecture via `detect_topology()` and works with any H
 | Gemma 2 / 3 | 2B-27B | Sliding + global | Varies | Topology detection | Architecture auto-detected. |
 | Cohere Command R | Varies | Sliding + global | Varies | Topology detection | `layer_types` field detected. |
 
-Models not listed should still work if they use the standard HuggingFace `DynamicCache` and `ALL_ATTENTION_FUNCTIONS` interface. If auto-detection fails, pass a manual `ModelTopology`:
+If auto-detection fails, pass a manual `ModelTopology`:
 
 ```python
 from kiv import KIVMiddleware, KIVConfig, ModelTopology

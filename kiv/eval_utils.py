@@ -9,8 +9,6 @@ import torch
 
 
 
-# ── Natural English filler paragraphs (diverse topics, no lorem ipsum) ──
-
 FILLER_PARAGRAPHS = [
     "The history of maritime navigation spans thousands of years, from the earliest Polynesian wayfinders who read ocean swells and star patterns to the invention of the magnetic compass in medieval China. European sailors of the Age of Exploration relied on astrolabes and cross-staffs to determine latitude, though longitude remained elusive until John Harrison built his marine chronometer in the eighteenth century. Modern vessels use satellite-based GPS systems that provide accuracy within a few meters, a dramatic improvement over the celestial methods that guided ships for millennia.",
     "Photosynthesis is the biochemical process by which green plants, algae, and certain bacteria convert light energy into chemical energy stored in glucose. The process occurs primarily in chloroplasts, where chlorophyll pigments absorb photons and drive electron transport chains that produce ATP and NADPH. These energy carriers then power the Calvin cycle, which fixes atmospheric carbon dioxide into three-carbon sugars. Without photosynthesis, the vast majority of life on Earth would cease to exist, as it forms the foundation of nearly every food chain.",

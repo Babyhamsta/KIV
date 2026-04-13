@@ -1,8 +1,4 @@
-"""
-Test bounded prefill quality impact.
-Compare full prefill vs capped prefill at short contexts where both work.
-If bounded prefill at cap=8K matches full prefill at 8K, it's safe to scale.
-"""
+"""Test bounded prefill quality impact."""
 import gc
 import time
 
@@ -60,9 +56,6 @@ def main():
         resp = tokenizer.decode(torch.cat(generated, dim=-1)[0], skip_special_tokens=True) if generated else ""
         return resp, logits_snapshot, prefill_time, cache
 
-    # ══════════════════════════════════════════════════════════════
-    # TEST 1: Phonebook (1000 entries, ~29K tokens)
-    # ══════════════════════════════════════════════════════════════
     print("=" * 90, flush=True)
     print("TEST 1: Phonebook lookup (1000 entries, ~29K tokens)", flush=True)
     print("=" * 90, flush=True)
@@ -104,9 +97,6 @@ def main():
             )
         print(flush=True)
 
-    # ══════════════════════════════════════════════════════════════
-    # TEST 2: Needle at 8K (5 depths)
-    # ══════════════════════════════════════════════════════════════
     print("=" * 90, flush=True)
     print("TEST 2: Needle-in-haystack at 8K context (5 depths)", flush=True)
     print("=" * 90, flush=True)

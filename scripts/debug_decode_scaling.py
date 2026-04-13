@@ -1,13 +1,4 @@
-"""
-Debug why model forward pass slows down with context length.
-
-With hot_budget=2048 and sliding_window=512, every layer should see
-bounded KV during decode. If decode time grows with context, something
-inside the model is scaling unexpectedly.
-
-This script profiles per-layer timing during a single decode step
-at different context lengths to find the culprit.
-"""
+"""Debug decode-time scaling with context length."""
 import gc
 import sys
 import time
@@ -83,7 +74,6 @@ def main():
         with torch.no_grad():
             model(input_ids=next_token, past_key_values=cache, use_cache=True)
 
-        # ── Profile full decode step ──
         next_token = torch.tensor([[1]], device=device)
         torch.cuda.synchronize()
         t0 = time.perf_counter()
@@ -92,7 +82,6 @@ def main():
         torch.cuda.synchronize()
         full_ms = (time.perf_counter() - t0) * 1000
 
-        # ── Profile per-layer ──
         # Hook each layer to measure time
         layer_times = {}
         hooks = []
@@ -122,7 +111,6 @@ def main():
         for h in hooks:
             h.remove()
 
-        # ── Analyze ──
         cold_len = max((store.cold_length for store in cache.cold_stores.values()), default=0)
 
         # Categorize layers
