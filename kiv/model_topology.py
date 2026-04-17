@@ -12,6 +12,16 @@ class ModelTopology:
     Captures which layers use global attention, which share KV,
     and the head geometry. Either auto-detected via ``detect_topology``
     or constructed manually for unsupported models.
+
+    Invariants (enforced in ``__post_init__``):
+
+    * ``independent_kv_layers`` is a subset of ``global_layer_indices``.
+    * ``kv_sharing_map`` keys are all members of ``global_layer_indices``
+      (a shared global layer must still be declared as a global layer
+      so the KIV attention wrapper binds its cache).
+    * ``kv_sharing_map`` values are all members of
+      ``independent_kv_layers`` (the source of a share must own a cold
+      store).
     """
 
     model_family: str
@@ -22,6 +32,31 @@ class ModelTopology:
     num_query_heads: int = 0
     num_kv_heads: int = 0
     head_dim: int = 0
+
+    def __post_init__(self) -> None:
+        globals_set = set(self.global_layer_indices)
+        independent_set = set(self.independent_kv_layers)
+
+        missing_independent = independent_set - globals_set
+        if missing_independent:
+            raise ValueError(
+                "independent_kv_layers must be a subset of "
+                f"global_layer_indices; extras: {sorted(missing_independent)}"
+            )
+
+        missing_keys = set(self.kv_sharing_map.keys()) - globals_set
+        if missing_keys:
+            raise ValueError(
+                "kv_sharing_map keys must all appear in "
+                f"global_layer_indices; extras: {sorted(missing_keys)}"
+            )
+
+        missing_sources = set(self.kv_sharing_map.values()) - independent_set
+        if missing_sources:
+            raise ValueError(
+                "kv_sharing_map values must all appear in "
+                f"independent_kv_layers; extras: {sorted(missing_sources)}"
+            )
 
     @staticmethod
     def manual(

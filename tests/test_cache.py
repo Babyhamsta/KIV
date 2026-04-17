@@ -62,3 +62,71 @@ def test_shared_layer_seq_length_resolves_to_source_layer():
 
     assert cache.get_seq_length(0) == 123
     assert cache.get_seq_length(1) == 123
+
+
+def test_truncate_to_hot_only_succeeds():
+    """Truncation within the hot window slices K/V tensors in place."""
+    topology = _topology()
+    cache = TieredKVCache(
+        PretrainedConfig(num_hidden_layers=1),
+        KIVConfig(prefetch_stream=False),
+        topology,
+        torch.device("cpu"),
+    )
+
+    key = torch.randn(1, 1, 10, 4)
+    value = torch.randn(1, 1, 10, 4)
+    cache.update(key, value, 0)
+
+    assert cache.truncate_to(6) is True
+
+    layer = cache.layers[0]
+    assert layer.keys.shape[2] == 6
+    assert layer.values.shape[2] == 6
+    assert cache._total_tokens[0] == 6
+    # Original content at the kept positions is preserved.
+    torch.testing.assert_close(layer.keys, key[:, :, :6, :])
+    torch.testing.assert_close(layer.values, value[:, :, :6, :])
+
+
+def test_truncate_to_rejects_lengths_beyond_current_total():
+    topology = _topology()
+    cache = TieredKVCache(
+        PretrainedConfig(num_hidden_layers=1),
+        KIVConfig(prefetch_stream=False),
+        topology,
+        torch.device("cpu"),
+    )
+
+    key = torch.randn(1, 1, 4, 4)
+    value = torch.randn(1, 1, 4, 4)
+    cache.update(key, value, 0)
+
+    assert cache.truncate_to(10) is False
+    # Cache state is unchanged on rejection.
+    assert cache.layers[0].keys.shape[2] == 4
+
+
+def test_truncate_to_rejects_truncation_into_cold():
+    """Rolling back past the cold boundary is not supported."""
+    config = KIVConfig(hot_budget=4, page_size=2, prefetch_stream=False)
+    topology = _topology()
+    cache = TieredKVCache(
+        PretrainedConfig(num_hidden_layers=1),
+        config,
+        topology,
+        torch.device("cpu"),
+    )
+
+    key = torch.randn(1, 1, 10, 4)
+    value = torch.randn(1, 1, 10, 4)
+    cache.update(key, value, 0)
+    cache.mark_prefill_complete()
+
+    # With hot_budget=4, 6 tokens now live in cold storage. Requesting
+    # truncation below cold_length must be rejected.
+    assert cache.cold_stores[0].cold_length == 6
+    assert cache.truncate_to(3) is False
+    # Truncation down to exactly cold_length is allowed (hot empties).
+    assert cache.truncate_to(6) is True
+    assert cache.layers[0].keys.shape[2] == 0

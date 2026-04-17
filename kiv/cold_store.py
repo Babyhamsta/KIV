@@ -84,6 +84,11 @@ class ColdKVStore:
         self._cached_candidate_idx: torch.Tensor | None = None
         self._cached_step: int = -1
 
+        # Retrieval telemetry: bounded ring buffer of per-call page and
+        # token selections plus running aggregates for score
+        # concentration and cold length.
+        self._telemetry = _RetrievalTelemetry()
+
     def _cpu_storage_copy(self, tensor: torch.Tensor) -> torch.Tensor:
         """Copy to CPU storage, pinning only when CUDA fetches will use it."""
         cpu_tensor = tensor.cpu()
@@ -204,8 +209,16 @@ class ColdKVStore:
             del summaries_exp
 
             num_select = min(kiv_config.top_pages, self.num_pages)
-            _, top_page_idx = coarse_scores.topk(num_select, dim=-1)
-            del coarse_scores
+            top_scores, top_page_idx = coarse_scores.topk(num_select, dim=-1)
+            self._telemetry.record_coarse(
+                coarse_scores=coarse_scores,
+                top_scores=top_scores,
+                top_page_idx=top_page_idx,
+                num_pages=self.num_pages,
+                cold_length=self.cold_length,
+                skipped=False,
+            )
+            del coarse_scores, top_scores
 
             # Deduplicate pages across batches, heads, and query positions.
             unique_pages = top_page_idx.reshape(-1).unique(sorted=True)
@@ -255,6 +268,15 @@ class ColdKVStore:
         candidate_v = torch.cat(parts_v, dim=2) if len(parts_v) > 1 else parts_v[0]
         candidate_idx = torch.cat(parts_idx) if len(parts_idx) > 1 else parts_idx[0]
 
+        # Emit a coarse-skipped record when the coarse pass did not run
+        # (no finalised pages yet; candidates came entirely from the
+        # partial buffer). Pairing this with the fine-pass record keeps
+        # ``coarse_calls == fine_calls`` so downstream diagnostics can
+        # reason about retrieval throughput without handling
+        # conditionally-missing records.
+        if self.num_pages == 0:
+            self._telemetry.record_coarse_skipped(cold_length=self.cold_length)
+
         return candidate_k, candidate_v, candidate_idx
 
 
@@ -288,6 +310,11 @@ class ColdKVStore:
             candidate_k = self._cached_candidate_k
             candidate_v = self._cached_candidate_v
             candidate_idx = self._cached_candidate_idx
+            # Pair the reuse with a coarse-skipped record so the
+            # telemetry's coarse/fine record counts stay symmetric.
+            self._telemetry.record_coarse_skipped(
+                cold_length=self.cold_length
+            )
         else:
             candidate_k, candidate_v, candidate_idx = self._select_candidates(
                 query, scaling, kiv_config
@@ -311,21 +338,36 @@ class ColdKVStore:
         agg_scores = fine_scores.amax(dim=(1, 2))
 
         actual_P = min(P, agg_scores.shape[-1])
-        _, top_local_idx = agg_scores.topk(actual_P, dim=-1)
+        top_agg_scores, top_local_idx = agg_scores.topk(actual_P, dim=-1)
 
-        # Select K and V via GPU index — no CPU round-trip
+        # Map local top indices back to the global token positions
+        # that will be fed into attention, then record fine-pass stats.
+        selected_global_idx = candidate_idx.gather(
+            0, top_local_idx.reshape(-1)
+        )
+        self._telemetry.record_fine(
+            agg_scores=agg_scores,
+            top_agg_scores=top_agg_scores,
+            selected_global_idx=selected_global_idx,
+            actual_P=int(actual_P),
+            requested_P=int(kiv_config.top_p),
+            cold_length=self.cold_length,
+        )
+
+        # Select K and V via GPU index — no CPU round-trip.
         gather_idx = top_local_idx[:, None, :, None].expand(
             -1, candidate_k.shape[1], -1, candidate_k.shape[3]
         )
         k_out = torch.gather(candidate_k, dim=2, index=gather_idx)
         v_out = torch.gather(candidate_v, dim=2, index=gather_idx)
 
-        # Pad to P for consistent shape
-        if k_out.shape[2] < P:
-            pad_size = P - k_out.shape[2]
-            k_out = torch.nn.functional.pad(k_out, (0, 0, 0, pad_size))
-            v_out = torch.nn.functional.pad(v_out, (0, 0, 0, pad_size))
-
+        # Return whatever width we have. The caller concatenates cold
+        # K/V onto hot K/V along the token dimension and extends the
+        # attention mask to match, so a shorter-than-``top_p`` result
+        # is handled correctly. Earlier revisions padded with zeros to
+        # reach ``top_p``; those zero keys produced real (zero-valued)
+        # attention logits and stole probability mass from genuine
+        # retrievals.
         return k_out, v_out
 
 
@@ -346,6 +388,14 @@ class ColdKVStore:
         self._cached_candidate_idx = None
         self._cached_step = -1
 
+    def telemetry_snapshot(self) -> dict:
+        """Return a snapshot of the retrieval telemetry buffer."""
+        return self._telemetry.snapshot()
+
+    def reset_telemetry(self) -> None:
+        """Clear the retrieval telemetry buffer."""
+        self._telemetry = _RetrievalTelemetry()
+
     def memory_bytes(self) -> dict[str, int]:
         """Report memory usage by tier."""
         k_cpu = self._k_pages.nelement() * self._k_pages.element_size() if self._k_pages is not None else 0
@@ -361,4 +411,171 @@ class ColdKVStore:
             "v_store_cpu": v_cpu,
             "page_summaries_gpu": summaries_gpu,
             "partial_gpu": partial_gpu,
+        }
+
+
+class _RetrievalTelemetry:
+    """Per-call statistics on the coarse-to-fine retrieval pass.
+
+    Each ``retrieve_top_kv`` call emits two records:
+
+    * **coarse**: which pages were selected and how sharply their
+      summary scores stood out from the mean.
+    * **fine**: which global token indices ended up in the returned
+      top-P and how concentrated the aggregated scores were.
+
+    Score concentration acts as a confidence proxy without needing
+    ground-truth labels. The token indices in ``selected_token_indices``
+    can be joined against known needle positions to compute an exact
+    retrieval hit rate.
+
+    The ring buffer is bounded so memory cost stays constant over
+    long-running sessions.
+    """
+
+    _MAX_BUFFER = 256
+
+    def __init__(self) -> None:
+        self.total_calls = 0
+        # Every retrieval call emits a coarse record (a real coarse
+        # pass, or a skipped placeholder for shared-layer reuse and
+        # partial-only cold states). Score sums accumulate only from
+        # real passes so averages reflect retrieval behaviour rather
+        # than being diluted by skip records.
+        self.coarse_calls = 0
+        self.coarse_real_calls = 0
+        self.coarse_top_score_sum = 0.0
+        self.coarse_mean_score_sum = 0.0
+        self.coarse_cold_length_sum = 0
+        self.fine_calls = 0
+        self.fine_top_score_sum = 0.0
+        self.fine_mean_score_sum = 0.0
+        self.selected_count_sum = 0
+        self._ring: list[dict] = []
+
+    def record_coarse(
+        self,
+        *,
+        coarse_scores: torch.Tensor,
+        top_scores: torch.Tensor,
+        top_page_idx: torch.Tensor,
+        num_pages: int,
+        cold_length: int,
+        skipped: bool = False,
+    ) -> None:
+        # Move scores off GPU immediately; the ring buffer must not hold
+        # live tensors that would pin VRAM or cross CUDA streams.
+        top = float(top_scores.max().detach().cpu())
+        mean = float(coarse_scores.mean().detach().cpu())
+        pages = top_page_idx.reshape(-1).unique().detach().cpu().tolist()
+
+        self.coarse_calls += 1
+        self.coarse_real_calls += 1
+        self.coarse_top_score_sum += top
+        self.coarse_mean_score_sum += mean
+        self.coarse_cold_length_sum += cold_length
+
+        self._push({
+            "kind": "coarse",
+            "cold_length": cold_length,
+            "num_pages": num_pages,
+            "num_pages_selected": len(pages),
+            "top_score": top,
+            "mean_score": mean,
+            "score_ratio": (top / abs(mean)) if mean else float("inf"),
+            "pages_selected": pages,
+            "skipped": skipped,
+        })
+
+    def record_coarse_skipped(self, *, cold_length: int) -> None:
+        """Log a placeholder coarse record when the coarse pass is bypassed.
+
+        Bypasses happen in two cases: the finalised-page store is empty
+        (candidates come entirely from the partial buffer) and a shared
+        layer reuses the cached candidate set from an earlier layer in
+        the same decode step. Emitting a placeholder keeps coarse-call
+        counts in lockstep with fine-call counts.
+        """
+        self.coarse_calls += 1
+        self.coarse_cold_length_sum += cold_length
+        self._push({
+            "kind": "coarse",
+            "cold_length": cold_length,
+            "num_pages": 0,
+            "num_pages_selected": 0,
+            "top_score": 0.0,
+            "mean_score": 0.0,
+            "score_ratio": 0.0,
+            "pages_selected": [],
+            "skipped": True,
+        })
+
+    def record_fine(
+        self,
+        *,
+        agg_scores: torch.Tensor,
+        top_agg_scores: torch.Tensor,
+        selected_global_idx: torch.Tensor,
+        actual_P: int,
+        requested_P: int,
+        cold_length: int,
+    ) -> None:
+        top = float(top_agg_scores.max().detach().cpu())
+        mean = float(agg_scores.mean().detach().cpu())
+        selected = selected_global_idx.detach().cpu().tolist()
+
+        self.fine_calls += 1
+        self.total_calls += 1
+        self.fine_top_score_sum += top
+        self.fine_mean_score_sum += mean
+        self.selected_count_sum += actual_P
+
+        self._push({
+            "kind": "fine",
+            "cold_length": cold_length,
+            "actual_P": actual_P,
+            "requested_P": requested_P,
+            "top_score": top,
+            "mean_score": mean,
+            "score_ratio": (top / abs(mean)) if mean else float("inf"),
+            "selected_token_indices": selected,
+        })
+
+    def _push(self, record: dict) -> None:
+        self._ring.append(record)
+        if len(self._ring) > self._MAX_BUFFER:
+            self._ring = self._ring[-self._MAX_BUFFER:]
+
+    def snapshot(self) -> dict:
+        aggregates = {
+            "total_calls": self.total_calls,
+            "coarse_calls": self.coarse_calls,
+            "coarse_real_calls": self.coarse_real_calls,
+            "coarse_skipped_calls": self.coarse_calls - self.coarse_real_calls,
+            "fine_calls": self.fine_calls,
+        }
+        if self.coarse_real_calls:
+            aggregates["avg_coarse_top_score"] = (
+                self.coarse_top_score_sum / self.coarse_real_calls
+            )
+            aggregates["avg_coarse_mean_score"] = (
+                self.coarse_mean_score_sum / self.coarse_real_calls
+            )
+        if self.coarse_calls:
+            aggregates["avg_cold_length"] = (
+                self.coarse_cold_length_sum / self.coarse_calls
+            )
+        if self.fine_calls:
+            aggregates["avg_fine_top_score"] = (
+                self.fine_top_score_sum / self.fine_calls
+            )
+            aggregates["avg_fine_mean_score"] = (
+                self.fine_mean_score_sum / self.fine_calls
+            )
+            aggregates["avg_selected_P"] = (
+                self.selected_count_sum / self.fine_calls
+            )
+        return {
+            "aggregates": aggregates,
+            "recent": list(self._ring),
         }

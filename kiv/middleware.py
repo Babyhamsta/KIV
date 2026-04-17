@@ -134,7 +134,7 @@ class KIVMiddleware:
         logger.info("KIV middleware uninstalled.")
 
     def create_cache(self, device: torch.device | None = None) -> TieredKVCache:
-        """Create a TieredKVCache configured for this model."""
+        """Create a TieredKVCache and bind it as the active cache."""
         if self.topology is None:
             raise RuntimeError("Call install() before create_cache().")
 
@@ -148,12 +148,28 @@ class KIVMiddleware:
             device=device,
         )
 
-        # Store cache reference on each global attention module
+        self.activate_cache(cache)
+        return cache
+
+    def activate_cache(self, cache: TieredKVCache | None) -> None:
+        """Point the KIV attention wrapper at ``cache`` for subsequent calls.
+
+        The KIV attention hook reads ``_kiv_cache`` directly off each
+        attention module (see ``_make_kiv_attention``). When a request is
+        served from a different slot than the most recently created one,
+        callers must activate the correct cache first, otherwise cold
+        retrieval reads from the wrong tiered store while hot state
+        comes from ``past_key_values``.
+        """
+        if self.topology is None or self._text_model is None:
+            return
         for layer_idx in self.topology.global_layer_indices:
             attn = self._text_model.layers[layer_idx].self_attn
-            attn._kiv_cache = cache
-
-        return cache
+            if cache is None:
+                if hasattr(attn, "_kiv_cache"):
+                    delattr(attn, "_kiv_cache")
+            else:
+                attn._kiv_cache = cache
 
     def chunked_prefill(
         self,

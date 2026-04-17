@@ -191,6 +191,71 @@ class TieredKVCache(DynamicCache):
         self._suppress_cold = False
         self._decode_step = 0
 
+    def truncate_to(self, new_len: int) -> bool:
+        """Trim each global layer to ``new_len`` tokens.
+
+        Returns ``True`` on success, ``False`` if the requested length
+        would require dropping tokens that have already been evicted
+        to cold storage. In that case the cache is left untouched.
+
+        The operation is intended for cases like chat regeneration,
+        where the client sends a request that is a strict prefix of
+        what the cache currently holds and the caller wants to reuse
+        the cache up to ``new_len`` instead of re-prefilling from
+        scratch. Keeping the truncation inside the hot window avoids
+        the complexity of "un-evicting" pages from cold.
+
+        Per-layer behaviour:
+
+        * ``new_len > current_total`` - rejected (cannot extend).
+        * ``new_len < cold_length`` - rejected (would require cold
+          truncation, which is not implemented).
+        * ``new_len`` within ``[cold_length, cold_length + hot_length]``
+          - hot K/V tensors are sliced to ``new_len - cold_length``
+          positions and total-token tracking is updated.
+
+        The cold store's candidate cache and partial-page buffers are
+        left intact: truncation only affects hot, and the partial
+        buffer contains tokens that are already counted in
+        ``cold_length``. The decode-step counter is reset so shared
+        layer candidate caching starts fresh on the next forward.
+        """
+        for layer_idx in self.topology.independent_kv_layers:
+            if layer_idx >= len(self.layers):
+                continue
+            layer = self.layers[layer_idx]
+            if not layer.is_initialized:
+                continue
+            cold_len = self.cold_stores[layer_idx].cold_length
+            hot_len = layer.keys.shape[2]
+            current_total = cold_len + hot_len
+            if new_len > current_total:
+                return False
+            if new_len < cold_len:
+                return False
+
+        for layer_idx in self.topology.independent_kv_layers:
+            if layer_idx >= len(self.layers):
+                continue
+            layer = self.layers[layer_idx]
+            if not layer.is_initialized:
+                continue
+            cold_len = self.cold_stores[layer_idx].cold_length
+            target_hot_len = new_len - cold_len
+            if target_hot_len < layer.keys.shape[2]:
+                layer.keys = layer.keys[:, :, :target_hot_len, :].contiguous()
+                layer.values = layer.values[:, :, :target_hot_len, :].contiguous()
+            self._total_tokens[layer_idx] = new_len
+
+        for store in self.cold_stores.values():
+            store._cached_candidate_k = None
+            store._cached_candidate_v = None
+            store._cached_candidate_idx = None
+            store._cached_step = -1
+
+        self._decode_step = 0
+        return True
+
     def memory_report(self) -> dict:
         """Report memory usage across all tiers."""
         hot_bytes = 0
