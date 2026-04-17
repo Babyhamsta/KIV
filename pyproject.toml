@@ -38,15 +38,24 @@ quantization = [
     "bitsandbytes>=0.43.0",
     "accelerate>=0.25.0",
 ]
+server = [
+    "fastapi>=0.110.0",
+    "uvicorn>=0.27.0",
+    "pydantic>=2.5.0",
+]
 test = [
     "pytest>=7.0.0",
     "datasets>=2.14.0",
+    "httpx>=0.26.0",
 ]
 all = [
-    "kiv[hf,quantization,test]",
+    "kiv[hf,quantization,server,test]",
     "tqdm>=4.65.0",
     "numpy>=1.24.0",
 ]
+
+[project.scripts]
+kiv = "kiv.server.cli:main"
 
 [project.urls]
 Repository = "https://github.com/Babyhamsta/KIV"
